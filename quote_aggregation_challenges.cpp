@@ -1,6 +1,6 @@
 //
 // Enhanced Quote Aggregation Challenges and Solutions
-// Created by Krapa Haritha on 13/10/25.
+
 //
 // This file addresses critical challenges in high-frequency quote aggregation
 // for FX price streaming systems like LSEG FX PriceStream

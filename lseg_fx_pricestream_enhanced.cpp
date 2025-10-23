@@ -1,7 +1,5 @@
 //
 // Enhanced LSEG FX PriceStream Implementation
-// Created by Krapa Haritha on 13/10/25.
-//
 // Key Improvements:
 // 1. Better separation of concerns with interfaces
 // 2. NUMA-aware memory allocation
