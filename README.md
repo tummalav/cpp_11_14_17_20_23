@@ -1,4 +1,3 @@
-# cpp_11_14_17_20_23
-# Tummala Venkata Sateesh
-# Git pull and push test from mac book pro
-
+Practicing C++11, 14, 17, 20 standards features in depth understanding and
+practicing. Also, low and ultra low latency systems/trading pipe and high
+thoughput for market data handlers design guidelines, and considerations. 

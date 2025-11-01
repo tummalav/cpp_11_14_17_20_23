@@ -276,7 +276,7 @@ public:
             total,
             dropped,
             requests,
-            total > 0 ? static_cast<double>(dropped) / total * 100.0 : 0.0,
+                       total > 0 ? static_cast<double>(dropped) / total * 100.0 : 0.0,
             getAvailableTickCount()
         };
     }
