@@ -1,0 +1,54 @@
+{
+    "network": {
+        "server_ip": "@ASX_SERVER_IP@",
+        "server_port": @ASX_SERVER_PORT@,
+        "local_ip": "0.0.0.0",
+        "local_port": 0,
+        "username": "@USERNAME@",
+        "password": "@PASSWORD@",
+        "session_id": "@SESSION_ID@",
+        "enable_heartbeat": true,
+        "heartbeat_interval_ms": 30000,
+        "connect_timeout_ms": 5000,
+        "read_timeout_ms": 1000,
+        "enable_nagle": false,
+        "tcp_nodelay": 1,
+        "so_rcvbuf_size": 65536,
+        "so_sndbuf_size": 65536
+    },
+    "session": {
+        "firm_id": "@FIRM_ID@",
+        "enable_order_tracking": true,
+        "max_orders_per_second": 10000,
+        "max_pending_orders": 1000,
+        "enable_latency_tracking": true,
+        "log_level": "INFO",
+        "log_file": "/var/log/ouch_handler.log"
+    },
+    "performance": {
+        "cpu_affinity": {
+            "receive_thread": 2,
+            "send_thread": 3,
+            "main_thread": 1
+        },
+        "memory": {
+            "huge_pages": true,
+            "lock_memory": true,
+            "prefault_pages": true
+        },
+        "network": {
+            "bypass_kernel": false,
+            "use_raw_sockets": false,
+            "interrupt_coalescing": false
+        }
+    },
+    "monitoring": {
+        "enable_statistics": true,
+        "statistics_interval_ms": 1000,
+        "enable_health_check": true,
+        "health_check_interval_ms": 5000,
+        "max_latency_threshold_us": 100,
+        "max_error_rate_percent": 1.0
+    }
+}
+
