@@ -379,8 +379,119 @@ void demonstrate_relaxed() {
 } // namespace relaxed_examples
 
 // ============================================================================
-// 2. MEMORY_ORDER_ACQUIRE and MEMORY_ORDER_RELEASE
+// 2. MEMORY_ORDER_ACQUIRE and MEMORY_ORDER_RELEASE - DETAILED EXPLANATION
 // ============================================================================
+
+/*
+ * ACQUIRE AND RELEASE MEMORY ORDERINGS EXPLAINED
+ * ==============================================
+ *
+ * MEMORY_ORDER_RELEASE (for stores)
+ * ----------------------------------
+ * What it means: When you WRITE/STORE a value with 'release', you're making a promise:
+ *
+ *   "All memory operations (reads AND writes) that happened BEFORE this store
+ *    in my thread will be visible to any thread that reads this value with acquire."
+ *
+ * Key guarantees:
+ *   ✅ NO REORDERING DOWN - Previous operations cannot move below the release store
+ *   ❌ CAN REORDER UP    - Later operations CAN move above the release store
+ *   🔒 PUBLISHING PATTERN - You're "releasing" data to other threads
+ *
+ * Visual Mental Model - Release Store (one-way barrier):
+ *   ┌─────────────┐
+ *   │  write A    │  ← Can reorder among themselves
+ *   │  write B    │  ← Can reorder among themselves
+ *   ├─────────────┤  ← BARRIER (release store)
+ *   │ ready = 1   │  ← Release store
+ *   ├─────────────┤
+ *   │  write C    │  ← Can move ABOVE barrier
+ *   │  write D    │  ← Can move ABOVE barrier
+ *   └─────────────┘
+ *
+ * Example:
+ *   // Thread 1 (Producer)
+ *   data = 42;                                 // Step 1: Write data
+ *   ready.store(true, memory_order_release);   // Step 2: Signal ready
+ *
+ *   Guarantee: Step 1 ALWAYS happens before Step 2
+ *   Any thread acquiring 'ready' will see data = 42
+ *
+ *
+ * MEMORY_ORDER_ACQUIRE (for loads)
+ * ---------------------------------
+ * What it means: When you READ/LOAD a value with 'acquire', you're making a promise:
+ *
+ *   "All memory operations (reads AND writes) that happen AFTER this load
+ *    in my thread will see the values written before the corresponding release store."
+ *
+ * Key guarantees:
+ *   ✅ NO REORDERING UP   - Subsequent operations cannot move above the acquire load
+ *   ❌ CAN REORDER DOWN   - Previous operations CAN move below the acquire load
+ *   🔓 ACQUIRING PATTERN  - You're "acquiring" data from another thread
+ *
+ * Visual Mental Model - Acquire Load (one-way barrier):
+ *   ┌─────────────┐
+ *   │  read X     │  ← Can move BELOW barrier
+ *   │  read Y     │  ← Can move BELOW barrier
+ *   ├─────────────┤  ← BARRIER (acquire load)
+ *   │ if (ready)  │  ← Acquire load
+ *   ├─────────────┤
+ *   │  read A     │  ← Cannot move ABOVE barrier
+ *   │  read B     │  ← Cannot move ABOVE barrier
+ *   └─────────────┘
+ *
+ * Example:
+ *   // Thread 2 (Consumer)
+ *   if (ready.load(memory_order_acquire)) {  // Step 3: Check ready
+ *       int value = data;                     // Step 4: Read data
+ *   }
+ *
+ *   Guarantee: If Step 3 sees 'true', Step 4 ALWAYS happens after
+ *   and will see data = 42
+ *
+ *
+ * COMPLETE SYNCHRONIZATION CHAIN
+ * -------------------------------
+ *   Producer: ① → ② (release)
+ *                 ↓ synchronizes-with
+ *   Consumer:     ③ (acquire) → ④
+ *
+ *   Result: ① happens-before ④
+ *
+ *
+ * WHY THIS MATTERS (Real Performance Impact)
+ * -------------------------------------------
+ * WITHOUT proper ordering (WRONG):
+ *   // CPU might reorder to:
+ *   ready = true;    // Oops! Signal before data is ready
+ *   payload = 123;   // Consumer might read garbage
+ *
+ * WITH release-acquire (CORRECT):
+ *   payload = 123;                          // Always executes first
+ *   ready.store(true, memory_order_release); // Always executes second
+ *
+ *
+ * COMMON PATTERNS
+ * ---------------
+ * | Pattern           | Store Uses | Load Uses  | Example                |
+ * |-------------------|------------|------------|------------------------|
+ * | Flag + Data       | release    | acquire    | Producer-consumer      |
+ * | Lock acquisition  | -          | acquire    | Entering critical sec  |
+ * | Lock release      | release    | -          | Leaving critical sec   |
+ * | Lazy init         | release    | acquire    | Double-checked locking |
+ *
+ *
+ * KEY TAKEAWAYS
+ * -------------
+ * 1. RELEASE = "Everything before this is now visible" (publish)
+ * 2. ACQUIRE = "Everything after this sees published data" (consume)
+ * 3. They work TOGETHER to create synchronization
+ * 4. NOT TRANSITIVE - only affects direct acquire-release pairs
+ * 5. CHEAPER than seq_cst on weak memory architectures (ARM, PowerPC)
+ *
+ * Mental Model: Release unlocks a gate, Acquire walks through it.
+ */
 
 namespace acquire_release_examples {
 
