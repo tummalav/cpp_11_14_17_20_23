@@ -326,7 +326,7 @@ namespace Network {
      * - Use kernel bypass (DPDK, OpenOnload)
      * - Implement zero-copy networking
      * - Use multicast for market data distribution
-     * - Optimize packet processing pipeline
+     * - Optimize packet processing pipeline111``1
      * - Minimize network hops
      */
 
