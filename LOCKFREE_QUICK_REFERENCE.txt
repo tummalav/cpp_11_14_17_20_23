@@ -220,6 +220,10 @@
 │ Process Communication:                                                    │
 │   • LOCKFREE_SHM_IPC_GUIDE.md - Complete IPC guide                       │
 │   • System config, real examples, troubleshooting                        │
+│                                                                           │
+│ Lock-Free Programming:                                                    │
+│   • ABA_PROBLEM_EXPLAINED.md - Complete ABA problem explanation          │
+│   • Real trading examples, solutions, why ring buffers are ABA-safe      │
 └───────────────────────────────────────────────────────────────────────────┘
 
 ════════════════════════════════════════════════════════════════════════════
