@@ -309,9 +309,10 @@ int main(int argc, char* argv[]) {
 
         std::cout << "Plugin ready. Starting performance tests...\n\n";
 
-        // Create event handler
-        PerfTestEventHandler handler;
-        plugin->registerEventHandler(std::make_shared<PerfTestEventHandler>(handler));
+        // Create event handler as shared_ptr (non-copyable due to std::mutex member)
+        auto handler_ptr = std::make_shared<PerfTestEventHandler>();
+        plugin->registerEventHandler(handler_ptr);
+        PerfTestEventHandler& handler = *handler_ptr;
 
         // Run warmup
         std::cout << "Warming up with " << config.warmup_orders << " orders...\n";
