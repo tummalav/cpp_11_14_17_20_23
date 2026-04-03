@@ -1,0 +1,33 @@
+# Build output directories
+cmake-build-debug/
+cmake-build-release/
+build/
+out/
+
+# Compiled binaries (no extension on macOS/Linux)
+# Keep named binaries like aba_demo, lockfree_benchmark etc. tracked explicitly
+*.o
+*.d
+*.a
+*.so
+*.so.*
+*.dylib
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake
+
+# IDE files
+.idea/
+.vscode/
+*.xcodeproj/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+

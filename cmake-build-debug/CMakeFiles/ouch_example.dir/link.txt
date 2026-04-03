@@ -1,0 +1,1 @@
+/usr/bin/c++  -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/ouch_example.dir/ouch_example_application.cpp.o -o ouch_example  -ldl
