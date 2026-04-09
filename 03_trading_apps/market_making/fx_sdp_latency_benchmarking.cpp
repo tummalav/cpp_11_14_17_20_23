@@ -27,22 +27,68 @@
 constexpr size_t CACHE_LINE = 64;
 
 // ---------------------------------------------------------------------------
-// TSC — ~2ns overhead, monotonic, no syscall
+// TSC — ~2-7ns overhead, monotonic, no syscall
+//
+// x86_64 strategy:
+//   tsc_start() = LFENCE + RDTSC   — prevents earlier insns from crossing
+//   tsc_end()   = RDTSCP           — serialising (waits for all prior insns)
+//
+//   Measure like:
+//     uint64_t t1 = tsc_start();
+//     ... code ...
+//     uint64_t t2 = tsc_end();
+//     uint64_t ns = TscCal::get().to_ns(t2 - t1);
+//
+//   tsc_now() = RDTSC only (no fence) — cheapest, use for pipeline stage marks
+//   where ordering is guaranteed by program flow
 // ---------------------------------------------------------------------------
-#if defined(__x86_64__)
-  #include <x86intrin.h>
-  #define CPU_PAUSE() _mm_pause()
-  inline uint64_t tsc_now() { unsigned a; return __rdtscp(&a); }
-#elif defined(__aarch64__)
-  #define CPU_PAUSE() asm volatile("yield":::"memory")
+#if defined(__x86_64__) || defined(_M_X64)
+  #define CPU_PAUSE() __asm__ volatile("pause" ::: "memory")
+
+  // Cheapest: no serialisation — use for mid-pipeline stage marks (~7 cycles)
   inline uint64_t tsc_now() {
-      uint64_t v; asm volatile("mrs %0,cntvct_el0":"=r"(v)); return v;
+      uint64_t lo, hi;
+      __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+      return (hi << 32) | lo;
   }
+
+  // Fenced start: LFENCE prevents earlier instructions crossing the timestamp
+  inline uint64_t tsc_start() {
+      uint64_t lo, hi;
+      __asm__ volatile("lfence\n\trdtsc\n\tlfence"
+                       : "=a"(lo), "=d"(hi)
+                       :: "memory");
+      return (hi << 32) | lo;
+  }
+
+  // Serialising end: RDTSCP waits for all prior instructions to complete
+  inline uint64_t tsc_end() {
+      uint64_t lo, hi;
+      uint32_t aux;                                    // processor ID (ignored)
+      __asm__ volatile("rdtscp"
+                       : "=a"(lo), "=d"(hi), "=c"(aux)
+                       :: "memory");
+      return (hi << 32) | lo;
+  }
+
+#elif defined(__aarch64__)
+  #define CPU_PAUSE() __asm__ volatile("yield" ::: "memory")
+
+  inline uint64_t tsc_now() {
+      uint64_t v;
+      __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+      return v;
+  }
+  inline uint64_t tsc_start() { return tsc_now(); }
+  inline uint64_t tsc_end()   { return tsc_now(); }
+
 #else
   #define CPU_PAUSE() do{}while(0)
   inline uint64_t tsc_now() {
       return (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
   }
+  inline uint64_t tsc_start() { return tsc_now(); }
+  inline uint64_t tsc_end()   { return tsc_now(); }
 #endif
 
 // ===========================================================================
@@ -141,7 +187,14 @@ struct QuoteTsMap {
     uint64_t t[N_STAGES]{};
     uint32_t pair_id{}, lp_id{};
 
-    void mark(Stage s) noexcept { t[s] = tsc_now(); }
+    // First stage: fenced RDTSC (prevent reorder with prior code)
+    // Mid stages:  plain RDTSC  (cheapest, ~7 cycles)
+    // Last stage:  RDTSCP       (serialising, waits for all prior insns)
+    void mark(Stage s) noexcept {
+        if      (s == NIC_RECV) t[s] = tsc_start();   // fenced start
+        else if (s == TCP_SENT) t[s] = tsc_end();      // serialising end
+        else                    t[s] = tsc_now();       // cheap mid-stage
+    }
 
     uint64_t ns(Stage from, Stage to) const noexcept {
         if (!t[from] || !t[to]) return 0;
@@ -151,11 +204,11 @@ struct QuoteTsMap {
 
 struct TradeTsMap {
     uint64_t order_recv{}, risk_ok{}, ll_sent{}, ll_ans{}, exec_rpt{};
-    void mark_order()   noexcept { order_recv = tsc_now(); }
-    void mark_risk()    noexcept { risk_ok    = tsc_now(); }
-    void mark_ll_sent() noexcept { ll_sent    = tsc_now(); }
-    void mark_ll_ans()  noexcept { ll_ans     = tsc_now(); }
-    void mark_exec()    noexcept { exec_rpt   = tsc_now(); }
+    void mark_order()   noexcept { order_recv = tsc_start(); } // fenced: measurement start
+    void mark_risk()    noexcept { risk_ok    = tsc_now();   }
+    void mark_ll_sent() noexcept { ll_sent    = tsc_now();   }
+    void mark_ll_ans()  noexcept { ll_ans     = tsc_now();   }
+    void mark_exec()    noexcept { exec_rpt   = tsc_end();   } // serialising: measurement end
 
     uint64_t order_to_ack()  const noexcept { return TscCal::get().to_ns(risk_ok  - order_recv); }
     uint64_t ll_rtt()        const noexcept { return TscCal::get().to_ns(ll_ans   - ll_sent);    }
