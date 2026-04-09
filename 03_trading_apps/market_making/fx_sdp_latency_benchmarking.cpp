@@ -217,8 +217,26 @@ struct TradeTsMap {
 
 // ===========================================================================
 // 4. SPSC stats queue — hot path pushes, stats thread drains (never blocks)
+//
+// KEY DESIGN: store RAW TSC TICKS in the queue — NOT nanoseconds.
+//
+//   Hot path cost breakdown per sample push:
+//     tsc_now()          :  ~7 cycles  (~3 ns)    ← RDTSC
+//     subtraction        :  ~1 cycle   (~0.3 ns)
+//     SPSC push          :  ~5 cycles  (~2 ns)    ← atomic store
+//     ─────────────────────────────────────────
+//     Total hot path     : ~13 cycles  (~5 ns)    ← NO float multiply!
+//
+//   Stats thread cost (off hot path):
+//     ticks * ns_per_tick:  ~4-6 ns    ← float multiply, done here only
+//
+//   If we converted in hot path (BAD):
+//     adds ~5 ns per sample × millions/sec = significant overhead
 // ===========================================================================
-struct Sample { uint64_t ns; uint8_t from, to; };
+struct Sample {
+    uint64_t ticks;    // raw TSC ticks diff — convert to ns in stats thread only
+    uint8_t  from, to;
+};
 
 template<size_t Sz>
 class SPSCStats {
@@ -262,11 +280,13 @@ struct Collector {
 
     SPSCStats<65536> q;
 
-    // Called from hot path — push to SPSC, never blocks
+    // Called from hot path — push RAW TICKS to SPSC, never blocks
+    // NO tick→ns conversion here — that happens in stats thread drain()
     void push(const QuoteTsMap& ts) noexcept {
         auto s = [&](Stage f, Stage t) {
-            uint64_t v = ts.ns(f,t);
-            if (v) q.push({v,(uint8_t)f,(uint8_t)t});
+            if (!ts.t[f] || !ts.t[t]) return;
+            uint64_t ticks = ts.t[t] - ts.t[f];   // raw subtraction — ~1 cycle
+            q.push({ticks, (uint8_t)f, (uint8_t)t});
         };
         s(NIC_RECV,    AGGREGATED);
         s(SOCKET_READ, FIX_PARSED);
@@ -277,21 +297,24 @@ struct Collector {
     }
 
     void push(const TradeTsMap& tt) noexcept {
+        // Convert here since trade flow is not ultra-hot-path
         if (uint64_t v = tt.order_to_ack())  ord_ack.record(v);
         if (uint64_t v = tt.ll_rtt())        ll_rtt.record(v);
         if (uint64_t v = tt.order_to_fill()) ord_fill.record(v);
     }
 
-    // Called from stats thread — drain SPSC and update histograms
+    // Called from stats thread — convert ticks→ns HERE, not in hot path
     void drain() noexcept {
         Sample s;
+        auto& cal = TscCal::get();
         while (q.pop(s)) {
-            if      (s.from==NIC_RECV    && s.to==AGGREGATED) lp_feed.record(s.ns);
-            else if (s.from==SOCKET_READ && s.to==FIX_PARSED) fix_parse.record(s.ns);
-            else if (s.from==FIX_PARSED  && s.to==AGGREGATED) agg_upd.record(s.ns);
-            else if (s.from==AGGREGATED  && s.to==MARKUP)     markup_h.record(s.ns);
-            else if (s.from==AGGREGATED  && s.to==TCP_SENT)   dist_lag.record(s.ns);
-            else if (s.from==NIC_RECV    && s.to==TCP_SENT)   quote_e2e.record(s.ns);
+            uint64_t ns = cal.to_ns(s.ticks);   // float multiply happens here only
+            if      (s.from==NIC_RECV    && s.to==AGGREGATED) lp_feed.record(ns);
+            else if (s.from==SOCKET_READ && s.to==FIX_PARSED) fix_parse.record(ns);
+            else if (s.from==FIX_PARSED  && s.to==AGGREGATED) agg_upd.record(ns);
+            else if (s.from==AGGREGATED  && s.to==MARKUP)     markup_h.record(ns);
+            else if (s.from==AGGREGATED  && s.to==TCP_SENT)   dist_lag.record(ns);
+            else if (s.from==NIC_RECV    && s.to==TCP_SENT)   quote_e2e.record(ns);
         }
     }
 
