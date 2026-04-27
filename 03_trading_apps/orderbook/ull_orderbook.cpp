@@ -646,6 +646,377 @@ private:
     }
 };
 
+// ============================================================
+// CrossingEngineBook – Internal Crossing Engine / Dark Pool / CRB
+//
+// Wraps ULLOrderBook and adds:
+//   1. Per-client pre-trade risk (position + notional caps)
+//      - Zero overhead for valid orders (check passes, hot path unchanged)
+//      - alignas(64) ClientRisk[client_id]: no false sharing between clients
+//   2. Internal crossing: buy/sell from same client pool matched first
+//   3. External fall-through SPSC queue: residual -> exchange connectivity
+//
+// Thread model:
+//   - add_order_risk()  : matching engine thread (single-threaded)
+//   - external SPSC pop : exchange connectivity thread
+//
+// Use cases:
+//   Prime brokerage CRB, agency dark pool, bank internal SOR, buy-side OMS
+// ============================================================
+static constexpr uint32_t MAX_CLIENTS = 256;
+
+// ClientRisk — exactly 1 cache line; separate cache lines per client ID
+// prevents false sharing when two strategies trigger risk checks simultaneously
+struct alignas(64) ClientRisk {
+    int64_t  max_position;    //  8  max |net position| in shares
+    int64_t  max_notional;    //  8  max gross notional (fixed-point)
+    int64_t  cur_position;    //  8  live net position (+long / -short)
+    int64_t  cur_notional;    //  8  live gross notional
+    uint64_t orders_sent;     //  8  running order count (rate limiting)
+    bool     enabled;         //  1
+    char     _pad[23];        // 23  → total 64 bytes
+
+    [[nodiscard]] bool check(Side side, int64_t price_fp, uint64_t qty) const noexcept {
+        if (!enabled) return true;
+        const int64_t delta    = (side == Side::BUY)
+                                  ? static_cast<int64_t>(qty)
+                                  : -static_cast<int64_t>(qty);
+        const int64_t notional = price_fp * static_cast<int64_t>(qty);
+        if (std::abs(cur_position + delta) > max_position)  return false;
+        if (cur_notional + notional        > max_notional)   return false;
+        return true;
+    }
+    void update(Side side, int64_t price_fp, uint64_t qty) noexcept {
+        const int64_t delta = (side == Side::BUY)
+                               ? static_cast<int64_t>(qty)
+                               : -static_cast<int64_t>(qty);
+        cur_position += delta;
+        cur_notional += price_fp * static_cast<int64_t>(qty);
+        ++orders_sent;
+    }
+};
+static_assert(sizeof(ClientRisk) == 64, "ClientRisk must be 1 cache line");
+
+class CrossingEngineBook {
+public:
+    explicit CrossingEngineBook(double ref_price) noexcept
+        : book_(ref_price,
+                [](const Trade& t, void* ctx) {
+                    auto* self = static_cast<CrossingEngineBook*>(ctx);
+                    if (self->trade_cb_) self->trade_cb_(t, self->cb_ctx_);
+                }, this)
+        , trade_cb_(nullptr), cb_ctx_(nullptr), rejected_count_(0)
+    {
+        for (auto& r : risk_) {
+            r.max_position = 1'000'000;
+            r.max_notional = 1'000'000 * to_fp(200.0);
+            r.cur_position = 0; r.cur_notional = 0;
+            r.orders_sent  = 0; r.enabled      = true;
+        }
+    }
+
+    void set_client_limit(uint32_t cid, int64_t max_pos, int64_t max_notional) noexcept {
+        if (cid >= MAX_CLIENTS) return;
+        risk_[cid].max_position = max_pos;
+        risk_[cid].max_notional = max_notional;
+    }
+
+    // add_order_risk: pre-trade check then match.
+    // Returns order_id (0 = risk breach — no Order allocated)
+    uint64_t add_order_risk(uint32_t cid, Side side, double price, uint64_t qty) noexcept {
+        const int64_t fp = to_fp(price);
+        if (cid < MAX_CLIENTS) {
+            ClientRisk& cr = risk_[cid];
+            if (__builtin_expect(!cr.check(side, fp, qty), 0)) {
+                ++rejected_count_;
+                std::cout << "  [RISK BREACH] client=" << cid
+                          << " side=" << (side == Side::BUY ? "BUY" : "SELL")
+                          << " qty=" << qty << " price=" << price << "\n";
+                return 0;
+            }
+            cr.update(side, fp, qty);
+        }
+        return book_.add_limit_fp(side, fp, qty);
+    }
+
+    // External fall-through queue: unmatched orders forwarded to exchange
+    [[nodiscard]] bool push_to_exchange(const OrderRequest& req) noexcept { return external_.try_push(req); }
+    [[nodiscard]] bool pop_external    (OrderRequest& req)       noexcept { return external_.try_pop(req);  }
+
+    void set_trade_callback(ULLOrderBook::TradeCallback cb, void* ctx) noexcept { trade_cb_ = cb; cb_ctx_ = ctx; }
+
+    ULLOrderBook& book()           noexcept { return book_; }
+    uint64_t rejected_count() const noexcept { return rejected_count_; }
+
+    void print_client(uint32_t cid) const noexcept {
+        if (cid >= MAX_CLIENTS) return;
+        const auto& r = risk_[cid];
+        std::cout << "  Client[" << cid << "]"
+                  << "  pos="         << r.cur_position
+                  << "  notional="    << r.cur_notional
+                  << "  maxPos="      << r.max_position
+                  << "  orders_sent=" << r.orders_sent << "\n";
+    }
+
+private:
+    ULLOrderBook              book_;
+    alignas(64) ClientRisk    risk_[MAX_CLIENTS]; // one cache line per client
+    SPSCQueue<QUEUE_CAPACITY> external_;           // fall-through to exchange
+
+    ULLOrderBook::TradeCallback trade_cb_;
+    void*                       cb_ctx_;
+    uint64_t                    rejected_count_;
+};
+
+// ============================================================
+// ShadowOrderBook – Algo / Strategy / Market Making side
+//
+//  A) L2 Market View
+//     - Written by feed-handler thread via update_bbo() / update_l2_snapshot()
+//     - Read by strategy thread via read_bbo() [SeqLock — wait-free reader]
+//     - BBO + seq_ on one cache line: single cache-line write per BBO update
+//
+//  B) Own-Order Tracker
+//     - Strategies track their own resting orders on the exchange
+//     - track_new / on_fill / on_cancel called by OMS exec-report callback
+//     - Uses object pool: zero heap allocation on critical OMS path
+//     - Net position tracked atomically (lock-free cross-thread visibility)
+//
+// ULL details:
+//   SeqLock on BBO         : wait-free, ~5-15 ns read/write
+//   alignas(64) net_pos_   : separate cache line; hot for strategy loop
+//   OwnOrder pool          : same arena-pool pattern as Order pool
+//   RDTSC timestamps        : ~1 cycle, no syscall
+// ============================================================
+
+// L2 price level — 32 bytes (2 per cache line)
+struct alignas(32) L2Level {
+    int64_t  price_fp;
+    uint64_t qty;
+    uint32_t order_count;
+    char     _pad[12];
+};
+static_assert(sizeof(L2Level) == 32);
+
+static constexpr uint32_t MAX_OWN_ORDERS = 2048;
+static constexpr uint32_t L2_DEPTH       = 10;
+
+// OwnOrder — 64 bytes (1 cache line); singly-linked (own orders don't need O(1) arbitrary cancel)
+struct alignas(64) OwnOrder {
+    uint64_t  exch_order_id;   //  8
+    int64_t   price_fp;        //  8
+    uint64_t  orig_qty;        //  8
+    uint64_t  remaining_qty;   //  8
+    uint64_t  timestamp_tsc;   //  8
+    OwnOrder* next;            //  8
+    uint32_t  slot_idx_;       //  4
+    uint32_t  client_id;       //  4
+    Side      side;            //  1
+    OStatus   status;          //  1
+    char      _pad[6];         //  6  → total = 64 bytes
+};
+static_assert(sizeof(OwnOrder) == 64, "OwnOrder must be 1 cache line");
+
+class ShadowOrderBook {
+public:
+    explicit ShadowOrderBook(double ref_price) noexcept
+        : bbo_bid_fp_(0), bbo_ask_fp_(0)
+        , bbo_bid_qty_(0), bbo_ask_qty_(0)
+        , l2_bid_depth_(0), l2_ask_depth_(0)
+        , net_position_(0)
+        , realized_pnl_fp_(0)
+        , ref_price_fp_(to_fp(ref_price))
+        , next_local_id_(1)
+    {
+        bbo_seq_.store(0, std::memory_order_relaxed);
+        bbo_bid_fp_ = bbo_ask_fp_ = 0;
+        bbo_bid_qty_ = bbo_ask_qty_ = 0;
+        l2_bid_depth_ = l2_ask_depth_ = 0;
+        std::memset(own_lookup_, 0, sizeof(own_lookup_));
+    }
+
+    // ── A) Market data feed updates ───────────────────────────────────────────
+
+    // BBO update — SeqLock write (single writer: feed handler thread)
+    // Increment seq to odd = "write in progress", then write, then increment to even
+    void update_bbo(int64_t bid_fp, uint64_t bid_qty,
+                    int64_t ask_fp, uint64_t ask_qty) noexcept {
+        bbo_seq_.fetch_add(1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        bbo_bid_fp_  = bid_fp;  bbo_ask_fp_  = ask_fp;
+        bbo_bid_qty_ = bid_qty; bbo_ask_qty_ = ask_qty;
+        std::atomic_thread_fence(std::memory_order_release);
+        bbo_seq_.fetch_add(1, std::memory_order_release);
+    }
+
+    // SeqLock BBO read (strategy thread) — wait-free, no mutex
+    // Spins only if writer is mid-write (very rare, ~nanoseconds)
+    bool read_bbo(int64_t& bid_fp, uint64_t& bid_qty,
+                  int64_t& ask_fp, uint64_t& ask_qty) const noexcept {
+        uint64_t s1, s2;
+        do {
+            s1 = bbo_seq_.load(std::memory_order_acquire);
+            if (s1 & 1u) {
+#if defined(__x86_64__)
+                __asm__ volatile("pause");
+#endif
+                continue;
+            }
+            bid_fp  = bbo_bid_fp_;  bid_qty = bbo_bid_qty_;
+            ask_fp  = bbo_ask_fp_;  ask_qty = bbo_ask_qty_;
+            std::atomic_thread_fence(std::memory_order_acquire);
+            s2 = bbo_seq_.load(std::memory_order_relaxed);
+        } while (s1 != s2);
+        return bid_fp > 0 && ask_fp > 0 && bid_fp < ask_fp;
+    }
+
+    // Full L2 snapshot (from L2 feed handler — less frequent than BBO)
+    void update_l2_snapshot(const L2Level* bids, uint32_t bc,
+                            const L2Level* asks, uint32_t ac) noexcept {
+        l2_bid_depth_ = std::min(bc, L2_DEPTH);
+        l2_ask_depth_ = std::min(ac, L2_DEPTH);
+        for (uint32_t i = 0; i < l2_bid_depth_; ++i) bid_l2_[i] = bids[i];
+        for (uint32_t i = 0; i < l2_ask_depth_; ++i) ask_l2_[i] = asks[i];
+        if (l2_bid_depth_ > 0 && l2_ask_depth_ > 0)
+            update_bbo(bids[0].price_fp, bids[0].qty, asks[0].price_fp, asks[0].qty);
+    }
+
+    // ── B) Own-order tracking (OMS exec-report callbacks) ─────────────────────
+
+    // Returns local tracking ID (0 = pool full)
+    uint64_t track_new(uint64_t exch_id, Side side,
+                       int64_t price_fp, uint64_t qty, uint32_t cid) noexcept {
+        OwnOrder* o = own_pool_.alloc();
+        if (__builtin_expect(!o, 0)) return 0;
+        const uint64_t lid = next_local_id_++;
+        o->exch_order_id = exch_id; o->price_fp = price_fp;
+        o->orig_qty = qty;          o->remaining_qty = qty;
+        o->timestamp_tsc = rdtsc_own();
+        o->next = nullptr;
+        o->client_id = cid; o->side = side; o->status = OStatus::ACTIVE;
+        own_lookup_[lid & (MAX_OWN_ORDERS - 1)] = o;
+        return lid;
+    }
+
+    // Fill notification — updates position and realized P&L (lock-free)
+    void on_fill(uint64_t lid, uint64_t fill_qty, int64_t fill_fp) noexcept {
+        OwnOrder* o = find_own(lid);
+        if (__builtin_expect(!o, 0)) return;
+        const uint64_t clamped = std::min(fill_qty, o->remaining_qty);
+        o->remaining_qty -= clamped;
+        const int64_t delta = (o->side == Side::BUY)
+                               ? static_cast<int64_t>(clamped)
+                               : -static_cast<int64_t>(clamped);
+        net_position_.fetch_add(delta, std::memory_order_relaxed);
+
+        // Realized P&L = (fill vs mid) × qty
+        const int64_t mid_fp = (bbo_bid_fp_ + bbo_ask_fp_) / 2;
+        const int64_t pnl    = (o->side == Side::BUY)
+            ? (mid_fp - fill_fp) * static_cast<int64_t>(clamped)
+            : (fill_fp - mid_fp) * static_cast<int64_t>(clamped);
+        realized_pnl_fp_.fetch_add(pnl, std::memory_order_relaxed);
+
+        if (o->remaining_qty == 0) {
+            o->status = OStatus::FILLED;
+            own_lookup_[lid & (MAX_OWN_ORDERS - 1)] = nullptr;
+            own_pool_.release(o->slot_idx_);
+        } else {
+            o->status = OStatus::PARTIAL;
+        }
+    }
+
+    void on_cancel(uint64_t lid) noexcept {
+        OwnOrder* o = find_own(lid);
+        if (__builtin_expect(!o, 0)) return;
+        o->status = OStatus::CANCELLED;
+        own_lookup_[lid & (MAX_OWN_ORDERS - 1)] = nullptr;
+        own_pool_.release(o->slot_idx_);
+    }
+
+    // ── C) Query API ──────────────────────────────────────────────────────────
+    [[nodiscard]] int64_t net_position()  const noexcept { return net_position_.load(std::memory_order_relaxed); }
+    [[nodiscard]] double  realized_pnl()  const noexcept { return from_fp(realized_pnl_fp_.load(std::memory_order_relaxed)); }
+    [[nodiscard]] double  bbo_bid()       const noexcept { return from_fp(bbo_bid_fp_); }
+    [[nodiscard]] double  bbo_ask()       const noexcept { return from_fp(bbo_ask_fp_); }
+    [[nodiscard]] double  mid()           const noexcept { return (bbo_bid() + bbo_ask()) / 2.0; }
+    [[nodiscard]] double  spread()        const noexcept { return bbo_ask() - bbo_bid(); }
+
+    void print_l2() const noexcept {
+        std::cout << std::fixed << std::setprecision(2)
+                  << "\n=== ShadowOrderBook (Algo/Strategy L2 view) ===\n"
+                  << "  BBO Bid: " << bbo_bid() << " x " << bbo_bid_qty_
+                  << "   Ask: "    << bbo_ask() << " x " << bbo_ask_qty_
+                  << "   Mid: "    << mid()
+                  << "   Spread: " << spread() << "\n"
+                  << "  NetPos: " << net_position()
+                  << "   RealizedPnL: " << realized_pnl() << "\n"
+                  << "  ASKS:\n";
+        for (int i = static_cast<int>(l2_ask_depth_) - 1; i >= 0; --i)
+            std::cout << "    " << from_fp(ask_l2_[i].price_fp)
+                      << " x " << ask_l2_[i].qty << "\n";
+        std::cout << "  --- spread ---\n  BIDS:\n";
+        for (uint32_t i = 0; i < l2_bid_depth_; ++i)
+            std::cout << "    " << from_fp(bid_l2_[i].price_fp)
+                      << " x " << bid_l2_[i].qty << "\n";
+        std::cout << "\n";
+    }
+
+private:
+    // OwnOrder pool (same arena approach as OrderPool)
+    struct OwnPool {
+        alignas(64) OwnOrder  pool_[MAX_OWN_ORDERS];
+        alignas(64) uint32_t  free_[MAX_OWN_ORDERS];
+        uint32_t              top_{MAX_OWN_ORDERS};
+        OwnPool() noexcept {
+            for (uint32_t i = 0; i < MAX_OWN_ORDERS; ++i) {
+                free_[i] = i;  pool_[i].slot_idx_ = i;
+                pool_[i].next = nullptr;
+            }
+        }
+        OwnOrder* alloc() noexcept {
+            if (__builtin_expect(top_ == 0, 0)) return nullptr;
+            return &pool_[free_[--top_]];
+        }
+        void release(uint32_t slot) noexcept { free_[top_++] = slot; }
+    } own_pool_;
+
+    [[nodiscard]] OwnOrder* find_own(uint64_t lid) noexcept {
+        OwnOrder* o = own_lookup_[lid & (MAX_OWN_ORDERS - 1)];
+        if (o && o->exch_order_id == lid) return o;
+        return nullptr;
+    }
+
+    [[nodiscard]] static uint64_t rdtsc_own() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+        return __rdtsc();
+#else
+        return static_cast<uint64_t>(
+            std::chrono::high_resolution_clock::now().time_since_epoch().count());
+#endif
+    }
+
+    // SeqLock BBO — bbo_seq_ + BBO fields on same cache line
+    // Single cache-line dirty on each BBO write (optimal for feed-heavy workloads)
+    alignas(64) mutable std::atomic<uint64_t> bbo_seq_{0};
+    int64_t  bbo_bid_fp_, bbo_ask_fp_;
+    uint64_t bbo_bid_qty_, bbo_ask_qty_;
+
+    // L2 snapshot arrays
+    alignas(64) L2Level bid_l2_[L2_DEPTH];
+    alignas(64) L2Level ask_l2_[L2_DEPTH];
+    uint32_t l2_bid_depth_, l2_ask_depth_;
+
+    // Own order lookup table
+    OwnOrder* own_lookup_[MAX_OWN_ORDERS];
+
+    // Position + P&L — isolated cache line (written by OMS, read by strategy)
+    alignas(64) std::atomic<int64_t> net_position_;
+    alignas(64) std::atomic<int64_t> realized_pnl_fp_;
+
+    const int64_t ref_price_fp_;
+    uint64_t      next_local_id_;
+};
+
 } // namespace ull_ob
 
 // ============================================================
@@ -674,8 +1045,6 @@ static inline double tsc_to_ns(uint64_t cycles) noexcept { return static_cast<do
 // ============================================================
 int main() {
     using namespace ull_ob;
-
-    std::cout << "=================================================================\n";
     std::cout << "  ULTRA LOW LATENCY ORDER BOOK – C++17\n";
     std::cout << "  Order size:      " << sizeof(Order)      << " bytes\n";
     std::cout << "  PriceLevel size: " << sizeof(PriceLevel) << " bytes\n";
@@ -843,16 +1212,129 @@ int main() {
                   << "p99.9=" << pct(match_latencies,99.9) << " ns\n";
     }
 
+    // ================================================================
+    // 9. CrossingEngineBook – Internal Crossing / Pre-Trade Risk
+    //    Use case: Prime broker CRB, agency dark pool, bank SOR
+    // ================================================================
+    std::cout << "\n--- 9. CROSSING ENGINE BOOK (Dark Pool / CRB) ---\n";
+    {
+        auto xbook = std::make_unique<CrossingEngineBook>(60.00);
+
+        // Client 1: allow up to 10,000 shares, large notional
+        xbook->set_client_limit(1, 10000, to_fp(60.0) * 10000LL);
+        // Client 2: tight limit — only 100 shares
+        xbook->set_client_limit(2, 100,   to_fp(60.0) * 100LL);
+
+        std::cout << "  Client 1 BUY 500 @ 60.00 (within limit)\n";
+        xbook->add_order_risk(1, Side::BUY,  60.00, 500);
+
+        std::cout << "  Client 3 SELL 300 @ 60.00 (internal cross with client 1)\n";
+        xbook->add_order_risk(3, Side::SELL, 60.00, 300);
+
+        std::cout << "  Client 4 SELL 150 @ 60.00 (further internal cross)\n";
+        xbook->add_order_risk(4, Side::SELL, 60.00, 150);
+
+        std::cout << "  Client 2 BUY 200 @ 60.05 (RISK BREACH — limit is 100 shares)\n";
+        xbook->add_order_risk(2, Side::BUY,  60.05, 200);  // expect REJECT
+
+        std::cout << "  Client 2 BUY 50 @ 60.05 (within limit — OK)\n";
+        xbook->add_order_risk(2, Side::BUY,  60.05, 50);   // expect OK
+
+        xbook->book().print_book(4);
+
+        std::cout << "\n  Client Risk Status:\n";
+        xbook->print_client(1);
+        xbook->print_client(2);
+        xbook->print_client(3);
+        xbook->print_client(4);
+        std::cout << "  Total rejected orders: " << xbook->rejected_count() << "\n";
+    }
+
+    // ================================================================
+    // 10. ShadowOrderBook – Algo / Strategy / Market Making side
+    //     Use case: Market making engine, stat-arb strategy P&L tracker
+    // ================================================================
+    std::cout << "\n--- 10. SHADOW ORDER BOOK (Algo/Strategy/Market Making) ---\n";
+    {
+        auto shadow = std::make_unique<ShadowOrderBook>(22.50);
+
+        // Feed handler pushes L2 snapshot (called from feed-handler thread)
+        L2Level bids[5] = {
+            {to_fp(22.48), 50000, 3, {}},
+            {to_fp(22.46), 30000, 2, {}},
+            {to_fp(22.44), 20000, 2, {}},
+            {to_fp(22.42), 15000, 1, {}},
+            {to_fp(22.40), 10000, 1, {}},
+        };
+        L2Level asks[5] = {
+            {to_fp(22.50), 45000, 4, {}},
+            {to_fp(22.52), 35000, 3, {}},
+            {to_fp(22.54), 25000, 2, {}},
+            {to_fp(22.56), 18000, 2, {}},
+            {to_fp(22.58), 12000, 1, {}},
+        };
+        shadow->update_l2_snapshot(bids, 5, asks, 5);
+        shadow->print_l2();
+
+        // Strategy sends own orders to exchange, tracks them here
+        std::cout << "  Strategy: tracking own BUY 10,000 @ 22.48 on exchange\n";
+        auto lid1 = shadow->track_new(1001, Side::BUY,  to_fp(22.48), 10000, 1);
+
+        std::cout << "  Strategy: tracking own SELL 8,000 @ 22.50 on exchange\n";
+        auto lid2 = shadow->track_new(1002, Side::SELL, to_fp(22.50),  8000, 1);
+
+        // OMS sends execution reports
+        std::cout << "  ExecReport: buy order partial fill 5,000 @ 22.48\n";
+        shadow->on_fill(lid1, 5000, to_fp(22.48));
+
+        std::cout << "  ExecReport: sell order full fill 8,000 @ 22.50\n";
+        shadow->on_fill(lid2, 8000, to_fp(22.50));
+
+        // Feed update: BBO moved up by 1 tick
+        std::cout << "  FeedUpdate: BBO now 22.50 x 22.52\n";
+        shadow->update_bbo(to_fp(22.50), 40000, to_fp(22.52), 30000);
+
+        // Strategy thread: SeqLock-safe BBO read
+        int64_t bbid, bask; uint64_t bq, aq;
+        bool ok = shadow->read_bbo(bbid, bq, bask, aq);
+        std::cout << "  SeqLock read_bbo -> bid=" << from_fp(bbid) << " x " << bq
+                  << "  ask=" << from_fp(bask) << " x " << aq
+                  << "  consistent=" << (ok ? "YES" : "NO") << "\n";
+
+        shadow->print_l2();
+        std::cout << "  Net Position: " << shadow->net_position() << " shares\n";
+        std::cout << "  Realized P&L: " << shadow->realized_pnl() << "\n";
+    }
+
     std::cout << "\n=================================================================\n";
-    std::cout << "  KEY ULL TECHNIQUES USED:\n";
-    std::cout << "  1. Pre-allocated Order pool     -> zero heap on hot path\n";
-    std::cout << "  2. Fixed-point int64 prices     -> O(1) array index, no map\n";
-    std::cout << "  3. Intrusive doubly-linked list -> O(1) cancel\n";
-    std::cout << "  4. alignas(64) Order/PriceLevel -> 1 cache line per object\n";
-    std::cout << "  5. SPSC lock-free ring buffer   -> network -> engine, ~10-20ns\n";
-    std::cout << "  6. Separate bid/ask arrays      -> no false sharing\n";
-    std::cout << "  7. Function pointer callbacks   -> no std::function overhead\n";
-    std::cout << "  8. __builtin_expect hints       -> branch predictor friendly\n";
+    std::cout << "  ULL TECHNIQUES — COMPLETE SUMMARY\n";
+    std::cout << "  MATCHING ENGINE (Exchange/CLOB):\n";
+    std::cout << "    1. Pre-allocated Order pool      -> zero heap on hot path\n";
+    std::cout << "    2. Fixed-point int64 prices      -> O(1) array index, no std::map\n";
+    std::cout << "    3. Intrusive doubly-linked list  -> O(1) cancel\n";
+    std::cout << "    4. alignas(64) Order/PriceLevel  -> 1 cache line per struct\n";
+    std::cout << "    5. SPSC lock-free ring buffer    -> gateway->engine, ~10-20 ns\n";
+    std::cout << "    6. Separate bid/ask arrays       -> no false sharing between sides\n";
+    std::cout << "    7. Raw fn-ptr callbacks          -> no std::function heap\n";
+    std::cout << "    8. __builtin_expect hints        -> branch predictor friendly\n";
+    std::cout << "  CROSSING ENGINE (Internal CRB/Dark Pool):\n";
+    std::cout << "    9. Per-client alignas(64) risk   -> no false sharing between clients\n";
+    std::cout << "   10. Zero-alloc risk breach path   -> block before Order alloc\n";
+    std::cout << "   11. Second SPSC queue             -> fall-through to exchange\n";
+    std::cout << "  SHADOW ORDER BOOK (Algo/Strategy/Market Making):\n";
+    std::cout << "   12. SeqLock BBO                  -> wait-free feed->strategy reads\n";
+    std::cout << "   13. OwnOrder object pool         -> zero heap on OMS report path\n";
+    std::cout << "   14. atomic<int64_t> net position -> lock-free cross-thread P&L\n";
+    std::cout << "   15. L2 snapshot flat array       -> cache-contiguous, no std::map\n";
+    std::cout << "   16. RDTSC timestamps             -> ~1 cycle, no syscall overhead\n";
+    std::cout << "=================================================================\n";
+    std::cout << "  Latency targets (RHEL8, isolated core, Solarflare NIC):\n";
+    std::cout << "    add_limit (passive):  50-100  ns\n";
+    std::cout << "    cancel (O(1)):        20-50   ns\n";
+    std::cout << "    add_limit (1 fill):   100-200 ns\n";
+    std::cout << "    SPSC push/pop:        10-20   ns\n";
+    std::cout << "    SeqLock BBO read:     5-15    ns\n";
+    std::cout << "    best_bid/ask query:   1-5     ns\n";
     std::cout << "=================================================================\n";
 
     return 0;
