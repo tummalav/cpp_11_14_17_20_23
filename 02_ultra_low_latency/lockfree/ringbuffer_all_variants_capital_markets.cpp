@@ -958,8 +958,9 @@ void bench_spsc_waitfree() {
     separator("BENCH 1: SPSC Wait-Free  [Feed → Strategy]");
 
     constexpr size_t N = 2'000'000;
-    SPSCWaitFree<MarketTick, 1 << 16> q;
-    LatencyHistogram hist;
+    // static → BSS segment (not stack). Ring is ~8MB; stack is only 8MB on macOS.
+    static SPSCWaitFree<MarketTick, 1 << 16> q;
+    static LatencyHistogram hist;
 
     std::thread prod([&]() {
         MarketTick t;
@@ -991,8 +992,9 @@ void bench_spsc_batched() {
 
     constexpr size_t N    = 2'000'000;
     constexpr size_t BATCH = 64;
-    SPSCBatched<MarketTick, 1 << 16, BATCH> q;
-    std::atomic<uint64_t> total_recv{0};
+    // static → BSS segment (not stack). Ring is ~4MB; would overflow macOS 8MB stack.
+    static SPSCBatched<MarketTick, 1 << 16, BATCH> q;
+    static std::atomic<uint64_t> total_recv{0};
 
     const auto t0 = std::chrono::steady_clock::now();
 
@@ -1036,7 +1038,8 @@ void bench_spmc_broadcast() {
 
     constexpr size_t N = 500'000;
     constexpr size_t NCONSUMERS = 4;
-    SPMCBroadcast<MarketTick, 1 << 16, 16> q;
+    // static → BSS segment (not stack). Ring is ~4MB; would overflow macOS 8MB stack.
+    static SPMCBroadcast<MarketTick, 1 << 16, 16> q;
 
     // Register all consumers before producer starts
     std::array<size_t, NCONSUMERS> cids{};
@@ -1081,10 +1084,12 @@ void bench_mpsc() {
     constexpr size_t N_PROD    = 4;
     constexpr size_t PER_PROD  = 250'000;
     constexpr size_t TOTAL     = N_PROD * PER_PROD;
-    MPSCLockFree<OrderMsg, 1 << 15> q;
+    // static → BSS segment (not stack). Each Cell is 128 bytes; 32K slots = 4MB.
+    static MPSCLockFree<OrderMsg, 1 << 15> q;
 
-    std::atomic<uint64_t> consumed{0};
-    LatencyHistogram hist;
+    static std::atomic<uint64_t> consumed{0};
+    static LatencyHistogram hist;
+    consumed.store(0, std::memory_order_relaxed);
 
     std::thread cons([&]() {
         OrderMsg o;
@@ -1125,10 +1130,12 @@ void bench_mpmc() {
 
     constexpr size_t N_PROD = 3, N_CONS = 2, PER_PROD = 200'000;
     constexpr size_t TOTAL  = N_PROD * PER_PROD;
-    MPMCLockFree<MarketTick, 1 << 15> q;
+    // static → BSS segment (not stack). Each Cell is 128 bytes; 32K slots = 4MB.
+    static MPMCLockFree<MarketTick, 1 << 15> q;
 
-    std::atomic<uint64_t> consumed{0};
-    LatencyHistogram hist;
+    static std::atomic<uint64_t> consumed{0};
+    static LatencyHistogram hist;
+    consumed.store(0, std::memory_order_relaxed);
 
     std::vector<std::thread> cons_threads;
     for (size_t ci = 0; ci < N_CONS; ++ci) {
@@ -1171,8 +1178,9 @@ void bench_seqlock() {
     separator("BENCH 6: SeqLock Snapshot [Best Quote Shared State]");
 
     constexpr size_t N = 2'000'000;
-    SeqLockSlot<MarketTick> slot;
-    LatencyHistogram hist;
+    // static → BSS segment (SeqLockSlot is small but keep consistent)
+    static SeqLockSlot<MarketTick> slot;
+    static LatencyHistogram hist;
 
     std::atomic<bool> running{true};
 
@@ -1213,9 +1221,11 @@ void bench_disruptor() {
     separator("BENCH 7: Disruptor-Style  [High-Rate Order Pipeline]");
 
     constexpr size_t N = 2'000'000;
-    DisruptorRing<MarketTick, 1 << 16> q;
-    LatencyHistogram hist;
-    uint64_t consumer_pos = 0;
+    // static → BSS segment. ring_(4MB) + avail_(4MB) = 8MB; would overflow stack.
+    static DisruptorRing<MarketTick, 1 << 16> q;
+    static LatencyHistogram hist;
+    static uint64_t consumer_pos = 0;
+    consumer_pos = 0;
 
     std::thread prod([&]() {
         MarketTick t;
