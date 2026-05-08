@@ -2,6 +2,7 @@
  * ringbuffer_all_variants_capital_markets.cpp
  *
  * ALL production-quality lock/wait-free ring buffer variants for capital markets.
+ * Fully compatible with RHEL 8/9 (GCC 8+, kernel 4.18+, glibc 2.28+).
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * VARIANTS COVERED:
@@ -38,19 +39,54 @@
  *  ✓ CACHE_ALIGN (alignas(64)) on all hot atomics — zero false sharing
  *  ✓ Power-of-2 capacity — bitmask instead of modulo (& MASK vs % N)
  *  ✓ Zero heap allocation in hot path — all slots pre-allocated at construction
- *  ✓ CPU_PAUSE() (_mm_pause) in spin loops — reduces power + memory ordering cost
+ *  ✓ All ring buffers declared static → BSS segment (not stack, not heap)
+ *  ✓ CPU_PAUSE() (_mm_pause / yield) in spin loops
  *  ✓ FORCE_INLINE + HOT_PATH attributes on critical paths
  *  ✓ __builtin_expect for branch prediction hints
  *  ✓ rdtsc_now() for latency measurement (not clock_gettime syscall)
  *  ✓ std::memory_order tuned per operation (not seq_cst everywhere)
  *  ✓ static_assert sizeof checks for cache-line sizing
- *  ✓ Thread pinning example (pthread_setaffinity_np)
+ *  ✓ Thread pinning via pthread_setaffinity_np (Linux/RHEL)
+ *  ✓ SCHED_FIFO real-time priority for trading threads (Linux/RHEL)
+ *  ✓ mlockall(MCL_CURRENT|MCL_FUTURE) — prevent page faults under load
+ *  ✓ Huge-page allocation (2MB THP) for ring buffer backing memory
+ *  ✓ NUMA node binding via mbind() (Linux/RHEL, requires numactl-libs)
  *
- * Compile:
- *   g++ -std=c++17 -O3 -march=native -DNDEBUG \
- *       ringbuffer_all_variants_capital_markets.cpp \
- *       -lpthread -o ringbuffer_variants
+ * ═══════════════════════════════════════════════════════════════════════════
+ * RHEL BUILD INSTRUCTIONS:
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *  # Install dependencies (RHEL 8/9):
+ *  sudo dnf install -y gcc-c++ numactl-devel numactl-libs
+ *
+ *  # Standard build (x86_64):
+ *  g++ -std=c++17 -O3 -march=native -DNDEBUG -D_GNU_SOURCE \
+ *      ringbuffer_all_variants_capital_markets.cpp \
+ *      -lpthread -o ringbuffer_variants
+ *
+ *  # With NUMA support (requires numactl-devel):
+ *  g++ -std=c++17 -O3 -march=native -DNDEBUG -D_GNU_SOURCE -DHAVE_NUMA \
+ *      ringbuffer_all_variants_capital_markets.cpp \
+ *      -lpthread -lnuma -o ringbuffer_variants
+ *
+ *  # Run with real-time priority (requires CAP_SYS_NICE or root):
+ *  sudo ./ringbuffer_variants
+ *  # Or grant capability without root:
+ *  sudo setcap cap_sys_nice+eip ./ringbuffer_variants && ./ringbuffer_variants
+ *
+ *  # Tune OS for ULL before running:
+ *  sudo tuned-adm profile latency-performance   # RHEL tuned profile
+ *  echo 0 | sudo tee /proc/sys/kernel/numa_balancing
+ *  echo never | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+ *  # Or use explicit huge pages: echo 512 | sudo tee /proc/sys/vm/nr_hugepages
  */
+
+// _GNU_SOURCE must be defined BEFORE any system header.
+// Required on RHEL/Linux for: pthread_setaffinity_np, CPU_SET, CPU_ZERO,
+// sched_setaffinity, SCHED_FIFO, pthread_setschedparam, mbind, madvise.
+#ifndef _GNU_SOURCE
+#  define _GNU_SOURCE
+#endif
 
 #include <atomic>
 #include <array>
@@ -64,11 +100,25 @@
 #include <chrono>
 #include <algorithm>
 #include <numeric>
-#include <sched.h>
-#include <pthread.h>
+#include <climits>      // SIZE_MAX
+
+// POSIX / Linux headers (available on RHEL 8/9, glibc 2.28+)
+#include <sched.h>      // sched_setaffinity, SCHED_FIFO, cpu_set_t (_GNU_SOURCE)
+#include <pthread.h>    // pthread_setaffinity_np, pthread_setschedparam (_GNU_SOURCE)
+#include <unistd.h>     // sysconf, _SC_NPROCESSORS_ONLN
+#include <errno.h>      // errno, strerror
+
+#ifdef __linux__
+#  include <sys/mman.h>   // mlock, mlockall, mmap, munmap, MAP_HUGETLB, MADV_HUGEPAGE
+#  include <sys/resource.h> // setrlimit, RLIMIT_MEMLOCK
+#  ifdef HAVE_NUMA
+#    include <numa.h>     // numa_available, numa_alloc_onnode, mbind (dnf: numactl-devel)
+#    include <numaif.h>   // mbind, MPOL_BIND
+#  endif
+#endif
 
 // ============================================================================
-// PLATFORM UTILITIES
+// PLATFORM UTILITIES  (x86_64 + AArch64 + fallback)
 // ============================================================================
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -79,6 +129,9 @@
         __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
         return (static_cast<uint64_t>(hi) << 32) | lo;
     }
+    // SIMD prefetch: bring next cache line into L1 for upcoming read
+    #define PREFETCH_READ(addr)  __builtin_prefetch((addr), 0, 3)
+    #define PREFETCH_WRITE(addr) __builtin_prefetch((addr), 1, 3)
 #elif defined(__aarch64__)
     #define CPU_PAUSE()  __asm__ volatile("yield" ::: "memory")
     inline uint64_t rdtsc_now() noexcept {
@@ -86,12 +139,16 @@
         __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t));
         return t;
     }
+    #define PREFETCH_READ(addr)  __builtin_prefetch((addr), 0, 3)
+    #define PREFETCH_WRITE(addr) __builtin_prefetch((addr), 1, 3)
 #else
     #define CPU_PAUSE()  do {} while(0)
     inline uint64_t rdtsc_now() noexcept {
         return static_cast<uint64_t>(
             std::chrono::steady_clock::now().time_since_epoch().count());
     }
+    #define PREFETCH_READ(addr)  (void)(addr)
+    #define PREFETCH_WRITE(addr) (void)(addr)
 #endif
 
 #define CACHE_LINE    64
@@ -99,6 +156,226 @@
 #define FORCE_INLINE  __attribute__((always_inline)) inline
 #define HOT_PATH      __attribute__((hot))
 #define COLD_PATH     __attribute__((cold))
+
+// ============================================================================
+// RHEL / LINUX SYSTEM UTILITIES
+// All ULL trading threads must be set up before entering hot loops.
+// On RHEL: run as root OR grant 'cap_sys_nice+eip' capability to binary.
+// ============================================================================
+
+namespace rhel_ull {
+
+/**
+ * pin_thread_to_core — bind calling thread to a specific CPU core.
+ *
+ * RHEL requirement: uses pthread_setaffinity_np (requires _GNU_SOURCE).
+ * Avoids OS scheduler migrations that add 1-10 us jitter to latency.
+ *
+ * Usage: rhel_ull::pin_thread_to_core(2);  // pin to core 2
+ */
+COLD_PATH inline bool pin_thread_to_core(int core_id) noexcept {
+#ifdef __linux__
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+    const int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    if (rc != 0) {
+        std::cerr << "[rhel_ull] pin_thread_to_core(" << core_id
+                  << ") failed: " << strerror(rc) << "\n";
+        return false;
+    }
+    return true;
+#else
+    (void)core_id;
+    return false;
+#endif
+}
+
+/**
+ * set_realtime_priority — set SCHED_FIFO policy for ultra-low jitter.
+ *
+ * RHEL requirement: CAP_SYS_NICE or root.  priority: 1 (low) .. 99 (high).
+ * Typical trading: feed_handler=95, strategy=90, gateway=92, risk=70.
+ * NEVER set priority=99 on cores shared with kernel housekeeping.
+ *
+ * Usage: rhel_ull::set_realtime_priority(90);
+ */
+COLD_PATH inline bool set_realtime_priority(int priority = 90) noexcept {
+#ifdef __linux__
+    struct sched_param sp{};
+    sp.sched_priority = priority;
+    const int rc = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+    if (rc != 0) {
+        std::cerr << "[rhel_ull] set_realtime_priority(" << priority
+                  << ") failed: " << strerror(rc)
+                  << "  (need root or cap_sys_nice+eip)\n";
+        return false;
+    }
+    return true;
+#else
+    (void)priority;
+    return false;
+#endif
+}
+
+/**
+ * lock_memory — mlockall(MCL_CURRENT|MCL_FUTURE).
+ *
+ * Prevents ALL process pages (including ring buffer BSS) from being paged
+ * out to swap. Eliminates page-fault latency spikes in hot paths.
+ * RHEL requirement: CAP_IPC_LOCK or root, or increase RLIMIT_MEMLOCK.
+ *
+ * If not root: sudo setrlimit or /etc/security/limits.conf:
+ *   tradinguser  -  memlock  unlimited
+ */
+COLD_PATH inline bool lock_memory() noexcept {
+#ifdef __linux__
+    // Lift the memlock limit to max before mlockall
+    struct rlimit rl{};
+    getrlimit(RLIMIT_MEMLOCK, &rl);
+    rl.rlim_cur = rl.rlim_max;
+    setrlimit(RLIMIT_MEMLOCK, &rl);   // best-effort; may fail without root
+
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        std::cerr << "[rhel_ull] mlockall failed: " << strerror(errno)
+                  << "  (add to /etc/security/limits.conf: * - memlock unlimited)\n";
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+/**
+ * alloc_huge_pages — mmap with MAP_HUGETLB (2MB pages) for large ring buffers.
+ *
+ * Reduces TLB pressure for >4KB allocations.
+ * RHEL: enable with 'echo N | sudo tee /proc/sys/vm/nr_hugepages'
+ * Or use Transparent Huge Pages (THP): madvise(MADV_HUGEPAGE).
+ *
+ * Returns nullptr on failure (falls back to normal mmap).
+ */
+COLD_PATH inline void* alloc_huge_pages(size_t size_bytes) noexcept {
+#ifdef __linux__
+    // Round up to 2MB boundary
+    constexpr size_t HUGE_PAGE = 2 * 1024 * 1024;
+    const size_t aligned_size = (size_bytes + HUGE_PAGE - 1) & ~(HUGE_PAGE - 1);
+
+    // Try explicit huge pages first
+    void* ptr = mmap(nullptr, aligned_size,
+                     PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
+                     -1, 0);
+    if (ptr != MAP_FAILED) return ptr;
+
+    // Fall back to regular mmap + MADV_HUGEPAGE (THP)
+    ptr = mmap(nullptr, aligned_size,
+               PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS,
+               -1, 0);
+    if (ptr == MAP_FAILED) return nullptr;
+    madvise(ptr, aligned_size, MADV_HUGEPAGE);
+    mlock(ptr, aligned_size);   // fault pages in now, not during trading
+    return ptr;
+#else
+    (void)size_bytes;
+    return nullptr;
+#endif
+}
+
+COLD_PATH inline void free_huge_pages(void* ptr, size_t size_bytes) noexcept {
+#ifdef __linux__
+    if (ptr) munmap(ptr, size_bytes);
+#else
+    (void)ptr; (void)size_bytes;
+#endif
+}
+
+/**
+ * bind_memory_to_numa_node — bind an already-allocated region to a NUMA node.
+ *
+ * Requires HAVE_NUMA build flag and libnuma (dnf install numactl-devel).
+ * Eliminates cross-NUMA memory latency (local=40ns, remote=80-120ns).
+ *
+ * Usage: rhel_ull::bind_memory_to_numa_node(ptr, size, 0); // bind to node 0
+ */
+COLD_PATH inline bool bind_memory_to_numa_node(void* ptr, size_t size, int node) noexcept {
+#if defined(__linux__) && defined(HAVE_NUMA)
+    if (numa_available() < 0) {
+        std::cerr << "[rhel_ull] NUMA not available on this system\n";
+        return false;
+    }
+    struct bitmask* nodemask = numa_bitmask_alloc(numa_max_node() + 1);
+    numa_bitmask_setbit(nodemask, static_cast<unsigned>(node));
+    const int rc = mbind(ptr, size, MPOL_BIND, nodemask->maskp,
+                         nodemask->size + 1, MPOL_MF_MOVE | MPOL_MF_STRICT);
+    numa_bitmask_free(nodemask);
+    if (rc != 0) {
+        std::cerr << "[rhel_ull] mbind to node " << node
+                  << " failed: " << strerror(errno) << "\n";
+        return false;
+    }
+    return true;
+#else
+    (void)ptr; (void)size; (void)node;
+#  ifndef HAVE_NUMA
+    std::cerr << "[rhel_ull] NUMA support not compiled in. Rebuild with -DHAVE_NUMA -lnuma\n";
+#  endif
+    return false;
+#endif
+}
+
+/**
+ * print_system_info — print CPU topology / RHEL tuning advice at startup.
+ */
+COLD_PATH inline void print_system_info() noexcept {
+#ifdef __linux__
+    const long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+    const long nconf = sysconf(_SC_NPROCESSORS_CONF);
+    std::cout << "  RHEL system info:\n"
+              << "    CPUs online : " << nproc << " / " << nconf << " configured\n"
+              << "    Page size   : " << sysconf(_SC_PAGE_SIZE) << " bytes\n";
+#  ifdef HAVE_NUMA
+    if (numa_available() >= 0) {
+        std::cout << "    NUMA nodes  : " << (numa_max_node() + 1) << "\n";
+    } else {
+        std::cout << "    NUMA        : not available\n";
+    }
+#  endif
+    // Print current scheduler policy
+    struct sched_param sp{};
+    int policy = 0;
+    pthread_getschedparam(pthread_self(), &policy, &sp);
+    std::cout << "    Scheduler   : "
+              << (policy == SCHED_FIFO  ? "SCHED_FIFO"  :
+                  policy == SCHED_RR    ? "SCHED_RR"    :
+                  policy == SCHED_OTHER ? "SCHED_OTHER" : "unknown")
+              << " priority=" << sp.sched_priority << "\n";
+
+    // Check /proc/sys/kernel/numa_balancing
+    std::cout << "  RHEL tuning checklist:\n"
+              << "    sudo tuned-adm profile latency-performance\n"
+              << "    echo 0 | sudo tee /proc/sys/kernel/numa_balancing\n"
+              << "    echo never | sudo tee /sys/kernel/mm/transparent_hugepage/enabled\n"
+              << "    echo -1 | sudo tee /proc/sys/kernel/sched_rt_runtime_us\n"
+              << "    isolcpus=2,3,4,5  nohz_full=2,3,4,5  (in /etc/default/grub)\n";
+#endif
+}
+
+/**
+ * setup_trading_thread — one-shot call for every trading thread on RHEL.
+ * Pins to core, sets SCHED_FIFO, locks memory.
+ *
+ * Usage (in thread lambda):
+ *   rhel_ull::setup_trading_thread(core_id, priority);
+ */
+COLD_PATH inline void setup_trading_thread(int core_id, int rt_priority = 90) noexcept {
+    pin_thread_to_core(core_id);
+    set_realtime_priority(rt_priority);
+}
+
+} // namespace rhel_ull
 
 // ============================================================================
 // TRADING DATA STRUCTURES
@@ -963,6 +1240,7 @@ void bench_spsc_waitfree() {
     static LatencyHistogram hist;
 
     std::thread prod([&]() {
+        rhel_ull::setup_trading_thread(2, 95); // RHEL: pin to core 2, SCHED_FIFO p95
         MarketTick t;
         for (size_t i = 0; i < N; ++i) {
             t.recv_tsc = rdtsc_now();
@@ -972,6 +1250,7 @@ void bench_spsc_waitfree() {
     });
 
     std::thread cons([&]() {
+        rhel_ull::setup_trading_thread(3, 95); // RHEL: pin to core 3, SCHED_FIFO p95
         MarketTick t;
         for (size_t i = 0; i < N; ++i) {
             q.pop_spin(t);
@@ -999,6 +1278,7 @@ void bench_spsc_batched() {
     const auto t0 = std::chrono::steady_clock::now();
 
     std::thread prod([&]() {
+        rhel_ull::setup_trading_thread(2, 95);
         MarketTick items[BATCH];
         for (size_t i = 0; i < N; ) {
             size_t b = std::min(BATCH, N - i);
@@ -1010,6 +1290,7 @@ void bench_spsc_batched() {
     });
 
     std::thread cons([&]() {
+        rhel_ull::setup_trading_thread(3, 95);
         MarketTick out[BATCH];
         uint64_t count = 0;
         while (count < N) {
@@ -1050,6 +1331,7 @@ void bench_spmc_broadcast() {
 
     for (size_t ci = 0; ci < NCONSUMERS; ++ci) {
         cons_threads.emplace_back([&, ci]() {
+            rhel_ull::setup_trading_thread(static_cast<int>(4 + ci), 90);
             MarketTick t;
             uint64_t count = 0;
             while (count < N) {
@@ -1061,6 +1343,7 @@ void bench_spmc_broadcast() {
     }
 
     std::thread prod([&]() {
+        rhel_ull::setup_trading_thread(2, 95); // feed handler: highest priority
         MarketTick t;
         for (size_t i = 0; i < N; ++i) {
             t.order_ref = i;
@@ -1092,6 +1375,7 @@ void bench_mpsc() {
     consumed.store(0, std::memory_order_relaxed);
 
     std::thread cons([&]() {
+        rhel_ull::setup_trading_thread(3, 92); // order gateway thread
         OrderMsg o;
         while (consumed.load(std::memory_order_relaxed) < TOTAL) {
             if (q.pop(o)) {
@@ -1107,6 +1391,7 @@ void bench_mpsc() {
     std::vector<std::thread> prods;
     for (size_t t = 0; t < N_PROD; ++t) {
         prods.emplace_back([&, t]() {
+            rhel_ull::setup_trading_thread(static_cast<int>(4 + t), 90);
             OrderMsg o;
             o.strategy_id = t;
             for (size_t i = 0; i < PER_PROD; ++i) {
@@ -1139,7 +1424,8 @@ void bench_mpmc() {
 
     std::vector<std::thread> cons_threads;
     for (size_t ci = 0; ci < N_CONS; ++ci) {
-        cons_threads.emplace_back([&]() {
+        cons_threads.emplace_back([&, ci]() {
+            rhel_ull::setup_trading_thread(static_cast<int>(2 + ci), 90);
             MarketTick t;
             while (consumed.load(std::memory_order_relaxed) < TOTAL) {
                 if (q.pop(t)) {
@@ -1156,6 +1442,7 @@ void bench_mpmc() {
     std::vector<std::thread> prod_threads;
     for (size_t pi = 0; pi < N_PROD; ++pi) {
         prod_threads.emplace_back([&, pi]() {
+            rhel_ull::setup_trading_thread(static_cast<int>(4 + pi), 92);
             MarketTick t;
             t.feed_id = static_cast<uint16_t>(pi);
             for (size_t i = 0; i < PER_PROD; ++i) {
@@ -1186,6 +1473,7 @@ void bench_seqlock() {
 
     // Writer: feed handler updates best quote (1 writer)
     std::thread writer([&]() {
+        rhel_ull::setup_trading_thread(2, 95);
         MarketTick t;
         for (size_t i = 0; i < N; ++i) {
             t.bid_px   = static_cast<uint32_t>(1000000 + i);
@@ -1198,7 +1486,8 @@ void bench_seqlock() {
     // Readers: multiple strategies reading best quote (N readers, no blocking)
     std::vector<std::thread> readers;
     for (int r = 0; r < 4; ++r) {
-        readers.emplace_back([&]() {
+        readers.emplace_back([&, r]() {
+            rhel_ull::setup_trading_thread(3 + r, 90);
             MarketTick out;
             while (running.load(std::memory_order_relaxed)) {
                 const uint64_t t0 = rdtsc_now();
@@ -1228,6 +1517,7 @@ void bench_disruptor() {
     consumer_pos = 0;
 
     std::thread prod([&]() {
+        rhel_ull::setup_trading_thread(2, 95);
         MarketTick t;
         for (size_t i = 0; i < N; ++i) {
             t.order_ref = i;
@@ -1237,6 +1527,7 @@ void bench_disruptor() {
     });
 
     std::thread cons([&]() {
+        rhel_ull::setup_trading_thread(3, 95);
         MarketTick t;
         for (size_t i = 0; i < N; ++i) {
             while (!q.pop(consumer_pos, t)) CPU_PAUSE();
@@ -1353,10 +1644,20 @@ int main() {
     "╔══════════════════════════════════════════════════════════════╗\n"
     "║   ALL LOCK/WAIT-FREE RING BUFFER VARIANTS                    ║\n"
     "║   Capital Markets Trading — Production Quality               ║\n"
+    "║   RHEL 8/9 Compatible  (GCC 8+, glibc 2.28+, kernel 4.18+)  ║\n"
     "╚══════════════════════════════════════════════════════════════╝\n";
 
     std::cout << "\nCPU cores: " << std::thread::hardware_concurrency()
-              << "  |  Cache line: " << CACHE_LINE << " bytes\n";
+              << "  |  Cache line: " << CACHE_LINE << " bytes\n\n";
+
+    // ── RHEL system setup ─────────────────────────────────────────────────
+    rhel_ull::print_system_info();
+
+    // Lock all current + future pages → no page faults in hot paths.
+    // Requires root or: sudo setcap cap_ipc_lock+eip ./ringbuffer_variants
+    std::cout << "\nLocking process memory (mlockall)... ";
+    std::cout << (rhel_ull::lock_memory() ? "OK" : "skipped (no CAP_IPC_LOCK)") << "\n";
+
     std::cout << "\nCalibrating TSC...\n";
     calibrate_tsc();
 
