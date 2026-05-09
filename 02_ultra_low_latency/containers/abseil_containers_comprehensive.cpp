@@ -3,35 +3,110 @@
  *
  * Google's Abseil C++ Library - High-Performance Containers
  * Focus: Ultra-low latency, cache-friendly, production-ready
+ * Platform: RHEL 8/9 (GCC 8+, glibc 2.28+) and macOS (development)
  *
- * Installation (macOS):
- *   brew install abseil
+ * ═══════════════════════════════════════════════════════════════════════════
+ * CONTAINERS COVERED:
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  Hash (Swiss Table - SIMD-accelerated open addressing):
+ *    absl::flat_hash_map   — fastest lookups, best cache locality (15-60ns)
+ *    absl::flat_hash_set   — set variant of flat_hash_map
+ *    absl::node_hash_map   — pointer-stable (safe to store iterators)
+ *    absl::node_hash_set   — set variant of node_hash_map
  *
- * Installation (RHEL):
- *   # Build from source: https://github.com/abseil/abseil-cpp
- *   git clone https://github.com/abseil/abseil-cpp.git
- *   cd abseil-cpp && mkdir build && cd build
- *   cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local
- *   make -j$(nproc) && sudo make install
+ *  Ordered (B-tree - cache-friendly vs std::map red-black tree):
+ *    absl::btree_map       — ordered, 2-3x faster than std::map (30-120ns)
+ *    absl::btree_set       — ordered set
+ *    absl::btree_multimap  — ordered multi-value map
+ *    absl::btree_multiset  — ordered multi-value set
  *
- * Compilation (macOS):
- *   g++ -std=c++17 -O3 -march=native -DNDEBUG \
- *       abseil_containers_comprehensive.cpp \
- *       -I/opt/homebrew/include -L/opt/homebrew/lib \
- *       -labsl_base -labsl_hash -labsl_raw_hash_set -labsl_strings \
- *       -labsl_synchronization -labsl_time \
- *       -lpthread -o abseil_benchmark
+ *  Sequential (SSO - avoid heap for small sizes):
+ *    absl::InlinedVector   — SSO vector: N elements inline, spills to heap
+ *    absl::FixedArray      — runtime-size, never resized
+ *    absl::Span            — non-owning zero-copy view (like std::span)
  *
- * Compilation (RHEL):
- *   g++ -std=c++17 -O3 -march=native -mavx2 -DNDEBUG \
- *       abseil_containers_comprehensive.cpp \
- *       -labsl_base -labsl_hash -labsl_raw_hash_set -labsl_strings \
- *       -lpthread -o abseil_benchmark
+ * ═══════════════════════════════════════════════════════════════════════════
+ * TRADING USE CASES IN THIS FILE:
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  1. Order Book price levels      → btree_map<Price, InlinedVector<Order,8>>
+ *  2. Symbol → price cache         → flat_hash_map<uint32_t, double>
+ *  3. Active orders by ID          → node_hash_map<uint64_t, Order>
+ *  4. SOR routing table            → flat_hash_map<VenueID, VenueState>
+ *  5. Dark pool crossing engine    → btree_multimap<Price, Order>
+ *  6. ETF arb basket lookup        → flat_hash_map<BasketID, Span<Leg>>
+ *  7. Index arb universe           → flat_hash_map<SymbolID, Weight>
+ *  8. Principal internalizer       → flat_hash_map<OrderID, InternalMatch>
+ *  9. Market making spread table   → flat_hash_map<InstrumentID, Quote>
+ * 10. Risk limit table             → flat_hash_map<DeskID, RiskLimits>
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * SWISS TABLE INTERNALS (Why flat_hash_map is 2-3x faster):
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  Memory layout per group (group = 16 slots):
+ *    [ctrl[0..15]: 16 × 1 byte control][data[0..15]: 16 × sizeof(T) bytes]
+ *    Control byte: 0xFF=empty, 0xFE=deleted, 0b0xxxxxxx=H2(7 low hash bits)
+ *
+ *  Lookup algo (SIMD, 1 cache line per probe group):
+ *    1. H1 = hash >> 7  → slot group index
+ *    2. H2 = hash & 127 → 7-bit fingerprint
+ *    3. Load 16 ctrl bytes into SSE2/NEON register (1 cache line read)
+ *    4. SIMD compare: find lanes where ctrl == H2 (16 candidates in parallel)
+ *    5. For each match: compare full key. Usually 0-1 matches.
+ *    → Result: avg 0-2 cache line reads per lookup vs O(1) avg but scattered
+ *      memory for std::unordered_map (separate chaining = pointer chase)
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * RHEL BUILD INSTRUCTIONS:
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *  # Install deps:
+ *  sudo dnf install -y gcc-c++ cmake git
+ *
+ *  # Option A: Build Abseil from source (recommended for RHEL):
+ *  git clone https://github.com/abseil/abseil-cpp.git && cd abseil-cpp
+ *  mkdir build && cd build
+ *  cmake .. -DCMAKE_BUILD_TYPE=Release \
+ *            -DCMAKE_INSTALL_PREFIX=/usr/local \
+ *            -DCMAKE_CXX_STANDARD=17 \
+ *            -DABSL_BUILD_TESTS=OFF
+ *  make -j$(nproc) && sudo make install
+ *  sudo ldconfig
+ *
+ *  # Option B: vcpkg (RHEL):
+ *  vcpkg install abseil
+ *
+ *  # Compile (RHEL - standard):
+ *  g++ -std=c++17 -O3 -march=native -DNDEBUG -D_GNU_SOURCE \
+ *      abseil_containers_comprehensive.cpp \
+ *      -labsl_base -labsl_hash -labsl_raw_hash_set \
+ *      -labsl_hashtablez_sampler -labsl_strings \
+ *      -lpthread -o abseil_benchmark
+ *
+ *  # Compile (macOS - Homebrew):
+ *  g++ -std=c++17 -O3 -march=native -DNDEBUG \
+ *      abseil_containers_comprehensive.cpp \
+ *      -I/opt/homebrew/include -L/opt/homebrew/lib \
+ *      -labsl_base -labsl_hash -labsl_raw_hash_set \
+ *      -labsl_hashtablez_sampler -labsl_strings \
+ *      -lpthread -o abseil_benchmark
+ *
+ *  # Run:
+ *  ./abseil_benchmark
+ *
+ *  # RHEL tuning for ULL benchmarks:
+ *  sudo tuned-adm profile latency-performance
+ *  sudo cpupower frequency-set -g performance
  */
+
+// _GNU_SOURCE required on RHEL for mlock, pthread_setaffinity_np, SCHED_FIFO
+#ifndef _GNU_SOURCE
+#  define _GNU_SOURCE
+#endif
 
 #include <iostream>
 #include <string>
 #include <vector>
+#include <array>
 #include <chrono>
 #include <algorithm>
 #include <iomanip>
@@ -39,26 +114,31 @@
 #include <thread>
 #include <atomic>
 #include <cstring>
+#include <numeric>
+#include <cstdint>
+#include <climits>
 
-// Abseil Hash Containers
+// Abseil Hash Containers (Swiss Tables)
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/container/node_hash_map.h"
 #include "absl/container/node_hash_set.h"
 
-// Abseil Ordered Containers (B-tree based)
+// Abseil Ordered Containers (B-tree — 2-3x faster than std::map)
 #include "absl/container/btree_map.h"
 #include "absl/container/btree_set.h"
 
-// Abseil Sequential Containers
+// Abseil Sequential Containers (SSO / fixed-size / zero-copy views)
 #include "absl/container/inlined_vector.h"
 #include "absl/container/fixed_array.h"
+
+// absl::Span: non-owning, zero-copy view into contiguous data
+// Use instead of (ptr, len) pairs — no extra allocation, no copy
+#include "absl/types/span.h"
 
 // Abseil Utilities
 #include "absl/strings/string_view.h"
 #include "absl/hash/hash.h"
-#include "absl/time/clock.h"
-#include "absl/time/time.h"
 
 //=============================================================================
 // PERFORMANCE MEASUREMENT UTILITIES
@@ -103,54 +183,124 @@ uint64_t measure_latency_ns(Func&& func) {
 
 //=============================================================================
 // TEST DATA STRUCTURES
+// All structs use fixed-size integer keys (uint64_t/uint32_t) for HFT.
+// String keys require hashing variable-length data → 2-5x slower.
+// Use symbol_id (uint32_t) or packed_symbol (8-char → uint64_t) instead.
 //=============================================================================
 
-struct Order {
-    uint64_t order_id;
-    double price;
-    uint32_t quantity;
-    char side;  // 'B' or 'S'
-    uint8_t padding[3];
-
-    Order() : order_id(0), price(0.0), quantity(0), side('B') {
-        std::memset(padding, 0, sizeof(padding));
-    }
-
-    Order(uint64_t id, double p, uint32_t q, char s)
-        : order_id(id), price(p), quantity(q), side(s) {
-        std::memset(padding, 0, sizeof(padding));
-    }
-
-    bool operator==(const Order& other) const {
-        return order_id == other.order_id;
-    }
-
-    bool operator<(const Order& other) const {
-        return order_id < other.order_id;
-    }
-};
-
-// Hash function for Order
-template <typename H>
-H AbslHashValue(H h, const Order& order) {
-    return H::combine(std::move(h), order.order_id);
+// ── Fixed-point price arithmetic (no float in hot path) ──────────────────
+// Prices stored as int64_t × PRICE_SCALE to avoid floating-point rounding.
+static constexpr int64_t PRICE_SCALE = 1'000'000; // 6 decimal places
+inline int64_t to_fp(double price) noexcept {
+    return static_cast<int64_t>(price * PRICE_SCALE);
+}
+inline double from_fp(int64_t fp) noexcept {
+    return static_cast<double>(fp) / PRICE_SCALE;
 }
 
-struct MarketData {
-    uint64_t timestamp;
+// ── Hot data first, cold data after first cache line ─────────────────────
+struct alignas(64) Order {
+    // CL0 hot: fields read on every match/cancel
+    uint64_t order_id;
+    uint64_t symbol_key;    // packed 8-char symbol as uint64_t
+    int64_t  price_fp;      // fixed-point price (no float)
+    uint32_t quantity;
+    uint32_t remaining_qty;
+    uint8_t  side;          // 'B'=buy, 'S'=sell
+    uint8_t  order_type;    // 'L'=limit, 'M'=market
+    uint8_t  tif;           // 'D'=day, 'I'=IOC, 'G'=GTC
+    uint8_t  venue_id;      // destination venue for SOR
+    uint32_t strategy_id;
+
+    // CL0 cold: timestamp (only read for audit/logging)
+    uint64_t recv_tsc;
+
+    Order() noexcept { std::memset(this, 0, sizeof(*this)); }
+    Order(uint64_t id, double price, uint32_t qty, char s, uint8_t venue = 0) noexcept
+        : order_id(id), symbol_key(0), price_fp(to_fp(price))
+        , quantity(qty), remaining_qty(qty)
+        , side(static_cast<uint8_t>(s)), order_type('L'), tif('D')
+        , venue_id(venue), strategy_id(0), recv_tsc(0) {}
+
+    bool operator==(const Order& o) const noexcept { return order_id == o.order_id; }
+    bool operator<(const Order& o)  const noexcept { return order_id < o.order_id; }
+};
+
+// Abseil hash support for Order (use order_id as key)
+template <typename H>
+H AbslHashValue(H h, const Order& o) {
+    return H::combine(std::move(h), o.order_id);
+}
+
+// ── Market data tick ──────────────────────────────────────────────────────
+struct alignas(64) MarketData {
+    uint64_t recv_tsc;
     uint32_t symbol_id;
-    double bid_price;
-    double ask_price;
+    int64_t  bid_fp;        // fixed-point
+    int64_t  ask_fp;
     uint32_t bid_size;
     uint32_t ask_size;
+    uint64_t seq;
 
-    MarketData() : timestamp(0), symbol_id(0), bid_price(0.0),
-                   ask_price(0.0), bid_size(0), ask_size(0) {}
-
+    MarketData() noexcept { std::memset(this, 0, sizeof(*this)); }
     MarketData(uint64_t ts, uint32_t sym, double bid, double ask,
-               uint32_t bsize, uint32_t asize)
-        : timestamp(ts), symbol_id(sym), bid_price(bid), ask_price(ask),
-          bid_size(bsize), ask_size(asize) {}
+               uint32_t bs, uint32_t as) noexcept
+        : recv_tsc(ts), symbol_id(sym)
+        , bid_fp(to_fp(bid)), ask_fp(to_fp(ask))
+        , bid_size(bs), ask_size(as), seq(0) {}
+};
+
+// ── SOR venue state ───────────────────────────────────────────────────────
+struct alignas(64) VenueState {
+    uint32_t venue_id;
+    uint32_t avail_qty;     // current available liquidity
+    int64_t  best_bid_fp;
+    int64_t  best_ask_fp;
+    uint32_t fill_rate_bps; // fill probability in basis points (0-10000)
+    uint32_t latency_us;    // round-trip latency to venue in microseconds
+    uint8_t  active;        // 1=connected, 0=disconnected
+    char     venue_code[7]; // e.g. "NYSE   ", "NASDAQ ", "ARCA   "
+
+    VenueState() noexcept { std::memset(this, 0, sizeof(*this)); }
+};
+
+// ── ETF basket leg ────────────────────────────────────────────────────────
+struct BasketLeg {
+    uint32_t symbol_id;
+    int32_t  shares;        // positive=long, negative=short
+    double   weight;        // portfolio weight
+};
+
+// ── Risk limits ───────────────────────────────────────────────────────────
+struct RiskLimits {
+    int64_t  max_position_fp;   // max net position in notional (fixed-point)
+    int64_t  max_pnl_loss_fp;   // max daily loss
+    uint32_t max_order_qty;     // max single order size
+    uint32_t max_order_rate;    // max orders per second
+    uint8_t  hard_kill;         // 1=kill switch activated
+    char     desk_name[31];
+};
+
+// ── Internal match (principal internalizer) ───────────────────────────────
+struct InternalMatch {
+    uint64_t buy_order_id;
+    uint64_t sell_order_id;
+    int64_t  match_price_fp;
+    uint32_t match_qty;
+    uint64_t match_tsc;         // timestamp of match
+};
+
+// ── Market making quote ───────────────────────────────────────────────────
+struct alignas(64) MMQuote {
+    uint32_t instrument_id;
+    int64_t  bid_fp;
+    int64_t  ask_fp;
+    uint32_t bid_qty;
+    uint32_t ask_qty;
+    uint64_t update_tsc;
+    uint16_t spread_bps;        // current spread in basis points
+    uint8_t  active;
+    char     _pad[5];
 };
 
 //=============================================================================
@@ -834,6 +984,426 @@ void print_best_practices() {
 }
 
 //=============================================================================
+// 7. ADVANCED TRADING USE CASES — SOR, DARK POOL, ETF ARB, INDEX ARB,
+//    MARKET MAKING, PRINCIPAL INTERNALIZER, RISK
+//=============================================================================
+
+void advanced_trading_use_cases() {
+    std::cout << "\n╔════════════════════════════════════════════════════════════╗\n";
+    std::cout << "║  ADVANCED CAPITAL MARKETS USE CASES                        ║\n";
+    std::cout << "╚════════════════════════════════════════════════════════════╝\n\n";
+
+    // ── UC1: Smart Order Router (SOR) ────────────────────────────────────
+    {
+        std::cout << "──────────────────────────────────────────────────────────\n";
+        std::cout << "UC1: Smart Order Router (SOR) — Venue Routing Table\n";
+        std::cout << "  Container: flat_hash_map<uint32_t, VenueState>\n";
+        std::cout << "  Use: Given order qty+side, find cheapest venue with liquidity\n";
+        std::cout << "  Why flat_hash_map: O(1) venue lookup by venue_id, 15-60ns\n\n";
+
+        // Pre-size at startup — NO rehashing in hot path
+        absl::flat_hash_map<uint32_t, VenueState> sor_table;
+        sor_table.reserve(64); // max 64 venues
+
+        // Startup: populate venues
+        const char* venues[] = {"NYSE   ", "NASDAQ ", "ARCA   ", "BATS   ",
+                                 "CBOE   ", "IEX    ", "LTSE   ", "MEMX   "};
+        for (uint32_t i = 0; i < 8; ++i) {
+            VenueState vs{};
+            vs.venue_id      = i;
+            vs.avail_qty     = 10000;
+            vs.best_bid_fp   = to_fp(99.95 - i * 0.01);
+            vs.best_ask_fp   = to_fp(100.05 + i * 0.01);
+            vs.fill_rate_bps = 8000 - i * 100; // 80% fill rate
+            vs.latency_us    = 50 + i * 10;
+            vs.active        = 1;
+            std::memcpy(vs.venue_code, venues[i], 7);
+            sor_table.emplace(i, vs);
+        }
+
+        // Hot path: find best venue for order (minimize price × latency)
+        LatencyStats route_stats;
+        for (int iter = 0; iter < 100000; ++iter) {
+            auto ns = measure_latency_ns([&]() {
+                uint32_t best_venue = UINT32_MAX;
+                int64_t  best_ask   = INT64_MAX;
+                for (const auto& [vid, vs] : sor_table) {
+                    if (!vs.active || vs.avail_qty == 0) continue;
+                    if (vs.best_ask_fp < best_ask) {
+                        best_ask   = vs.best_ask_fp;
+                        best_venue = vid;
+                    }
+                }
+                volatile auto r = best_venue;
+            });
+            route_stats.add(ns);
+        }
+        route_stats.print("  SOR: find best venue (8 venues)");
+        std::cout << "  ✅ 8-venue scan in flat_hash_map: cache-resident hot path\n\n";
+    }
+
+    // ── UC2: Dark Pool Crossing Engine ───────────────────────────────────
+    {
+        std::cout << "──────────────────────────────────────────────────────────\n";
+        std::cout << "UC2: Dark Pool Crossing Engine\n";
+        std::cout << "  Container: btree_multimap<int64_t, Order> (buy + sell books)\n";
+        std::cout << "  Use: Match buy orders >= ask price with sell orders\n";
+        std::cout << "  Why btree_multimap: sorted by price, O(log N) crossing point\n\n";
+
+        // Buy side: sorted DESCENDING (highest bid first) → negate price
+        // Sell side: sorted ASCENDING (lowest ask first)
+        absl::btree_multimap<int64_t, Order> dark_buy;   // key = -price_fp
+        absl::btree_multimap<int64_t, Order> dark_sell;  // key = +price_fp
+
+        // Populate dark pool with resting orders
+        std::mt19937 rng(42);
+        for (uint64_t i = 0; i < 1000; ++i) {
+            double price = 99.0 + (rng() % 200) * 0.01;
+            Order buy(i, price, 100, 'B');
+            dark_buy.emplace(-to_fp(price), buy);
+
+            Order sell(10000 + i, price + 0.02, 100, 'S');
+            dark_sell.emplace(to_fp(price + 0.02), sell);
+        }
+
+        // Hot path: find crossing orders (buy_price >= sell_price)
+        LatencyStats cross_stats;
+        for (int iter = 0; iter < 10000; ++iter) {
+            auto ns = measure_latency_ns([&]() {
+                uint32_t crosses = 0;
+                // Iterate: highest buy bid vs lowest sell ask
+                auto buy_it  = dark_buy.begin();  // highest bid (negated)
+                auto sell_it = dark_sell.begin();  // lowest ask
+                while (buy_it != dark_buy.end() && sell_it != dark_sell.end()) {
+                    int64_t bid_fp = -buy_it->first;
+                    int64_t ask_fp =  sell_it->first;
+                    if (bid_fp < ask_fp) break; // no cross
+                    ++crosses;
+                    ++buy_it; ++sell_it;
+                    if (crosses >= 10) break; // max N crosses per cycle
+                }
+                volatile auto r = crosses;
+            });
+            cross_stats.add(ns);
+        }
+        cross_stats.print("  Dark pool: find crossing orders (1K each side)");
+        std::cout << "  ✅ btree sorted by price: O(log N) to crossing point\n\n";
+    }
+
+    // ── UC3: ETF Arbitrage — Basket Lookup ───────────────────────────────
+    {
+        std::cout << "──────────────────────────────────────────────────────────\n";
+        std::cout << "UC3: ETF Arb — Basket Component Lookup\n";
+        std::cout << "  Container: flat_hash_map<uint32_t, absl::Span<BasketLeg>>\n";
+        std::cout << "  Use: Given ETF trade, instantly find all N component legs\n";
+        std::cout << "  Why Span: zero-copy view into pre-allocated leg array\n\n";
+
+        // Pre-allocate basket leg storage at startup (no heap in hot path)
+        constexpr size_t MAX_BASKETS  = 500;
+        constexpr size_t MAX_LEGS     = 50;
+        // BSS: legs stored in flat array, span = view into it
+        static std::array<BasketLeg, MAX_BASKETS * MAX_LEGS> leg_pool{};
+
+        absl::flat_hash_map<uint32_t, absl::Span<BasketLeg>> etf_baskets;
+        etf_baskets.reserve(MAX_BASKETS);
+
+        // Startup: populate SPY, QQQ, IWM components
+        for (uint32_t etf_id = 0; etf_id < 10; ++etf_id) {
+            uint32_t n_legs = 20 + etf_id * 5; // 20-65 components
+            if (n_legs > MAX_LEGS) n_legs = MAX_LEGS;
+            BasketLeg* base = &leg_pool[etf_id * MAX_LEGS];
+            for (uint32_t j = 0; j < n_legs; ++j) {
+                base[j].symbol_id = etf_id * 100 + j;
+                base[j].shares    = static_cast<int32_t>(100 - j);
+                base[j].weight    = 1.0 / n_legs;
+            }
+            etf_baskets.emplace(etf_id,
+                absl::Span<BasketLeg>(base, n_legs));
+        }
+
+        // Hot path: ETF trade arrives → get basket → compute delta hedge
+        LatencyStats hedge_stats;
+        for (int iter = 0; iter < 100000; ++iter) {
+            auto ns = measure_latency_ns([&]() {
+                auto it = etf_baskets.find(iter % 10); // find basket
+                if (it == etf_baskets.end()) return;
+                // Iterate legs (zero-copy span — no allocation)
+                double total_delta = 0.0;
+                for (const auto& leg : it->second) {
+                    total_delta += leg.shares * leg.weight;
+                }
+                volatile double r = total_delta;
+            });
+            hedge_stats.add(ns);
+        }
+        hedge_stats.print("  ETF arb: lookup basket + sum delta (avg 35 legs)");
+        std::cout << "  ✅ Span = zero-copy: no allocation in hot path\n\n";
+    }
+
+    // ── UC4: Index Arbitrage — Universe Weight Table ──────────────────────
+    {
+        std::cout << "──────────────────────────────────────────────────────────\n";
+        std::cout << "UC4: Index Arb — Index Component Weight Lookup\n";
+        std::cout << "  Container: flat_hash_map<uint32_t, double> (symbol→weight)\n";
+        std::cout << "  Use: Given market tick on S&P500 member, find its index weight\n";
+        std::cout << "  Why flat_hash_map: 500 symbols, sub-30ns lookup needed\n\n";
+
+        absl::flat_hash_map<uint32_t, double> index_weights;
+        index_weights.reserve(512); // 512 = next power of 2 after 500 (SP500)
+
+        for (uint32_t sym = 0; sym < 500; ++sym) {
+            index_weights.emplace(sym, 1.0 / 500.0);
+        }
+
+        LatencyStats weight_stats;
+        std::mt19937 rng2(999);
+        for (int iter = 0; iter < 100000; ++iter) {
+            uint32_t sym_id = rng2() % 500;
+            auto ns = measure_latency_ns([&]() {
+                auto it = index_weights.find(sym_id);
+                volatile double w = (it != index_weights.end()) ? it->second : 0.0;
+            });
+            weight_stats.add(ns);
+        }
+        weight_stats.print("  Index arb: weight lookup (500-member index)");
+        std::cout << "  ✅ Integer key (uint32_t): hashes in 1 cycle, no string hash\n\n";
+    }
+
+    // ── UC5: Market Making — Spread/Quote Table ───────────────────────────
+    {
+        std::cout << "──────────────────────────────────────────────────────────\n";
+        std::cout << "UC5: Market Making — Active Quote State\n";
+        std::cout << "  Container: flat_hash_map<uint32_t, MMQuote>\n";
+        std::cout << "  Use: Feed tick → lookup existing quote → decide to reprice\n";
+        std::cout << "  Hot path: ~1M ticks/sec × N instruments\n\n";
+
+        absl::flat_hash_map<uint32_t, MMQuote> mm_quotes;
+        mm_quotes.reserve(4096); // 4K instruments
+
+        // Startup: populate quotes for all instruments
+        for (uint32_t inst = 0; inst < 1000; ++inst) {
+            MMQuote q{};
+            q.instrument_id = inst;
+            q.bid_fp  = to_fp(99.95);
+            q.ask_fp  = to_fp(100.05);
+            q.bid_qty = 100;
+            q.ask_qty = 100;
+            q.active  = 1;
+            q.spread_bps = 10;
+            mm_quotes.emplace(inst, q);
+        }
+
+        // Hot path: tick arrives → update quote (typical MM hot path)
+        LatencyStats mm_stats;
+        for (int iter = 0; iter < 200000; ++iter) {
+            uint32_t inst = iter % 1000;
+            auto ns = measure_latency_ns([&]() {
+                auto it = mm_quotes.find(inst);
+                if (it != mm_quotes.end()) {
+                    it->second.bid_fp  = to_fp(99.94 + (iter % 10) * 0.01);
+                    it->second.ask_fp  = to_fp(100.06 + (iter % 10) * 0.01);
+                    it->second.update_tsc = static_cast<uint64_t>(iter);
+                }
+            });
+            mm_stats.add(ns);
+        }
+        mm_stats.print("  MM: hit quote state + update prices (1K instruments)");
+        std::cout << "  ✅ Pre-reserved map: zero rehash in hot path\n\n";
+    }
+
+    // ── UC6: Principal Internalizer ──────────────────────────────────────
+    {
+        std::cout << "──────────────────────────────────────────────────────────\n";
+        std::cout << "UC6: Principal Internalizer — Client vs Firm Book Matching\n";
+        std::cout << "  Container: node_hash_map<uint64_t, Order> (firm resting orders)\n";
+        std::cout << "  Container: btree_multimap<int64_t, uint64_t> (price → order_id)\n";
+        std::cout << "  Why node_hash_map: stable pointers → safe to keep references\n\n";
+
+        // Firm's resting inventory (node_hash_map = stable references)
+        absl::node_hash_map<uint64_t, Order> firm_book;
+        firm_book.reserve(10000);
+
+        // Price index for fast crossing
+        absl::btree_multimap<int64_t, uint64_t> price_idx; // price_fp → order_id
+
+        // Populate firm book with resting orders
+        for (uint64_t i = 0; i < 500; ++i) {
+            Order o(i, 100.0 + (i % 100) * 0.01, 500, 'S');
+            auto [it, ok] = firm_book.emplace(i, o);
+            if (ok) price_idx.emplace(o.price_fp, i);
+        }
+
+        // Hot path: client buy order arrives → find firm sell at best price
+        LatencyStats intern_stats;
+        for (int iter = 0; iter < 50000; ++iter) {
+            int64_t client_bid = to_fp(100.50);
+            auto ns = measure_latency_ns([&]() {
+                // Find lowest firm ask <= client bid
+                auto it = price_idx.begin();
+                uint32_t matched = 0;
+                while (it != price_idx.end() && it->first <= client_bid) {
+                    auto firm_it = firm_book.find(it->second);
+                    if (firm_it != firm_book.end()) ++matched;
+                    ++it;
+                    if (matched >= 3) break;
+                }
+                volatile auto r = matched;
+            });
+            intern_stats.add(ns);
+        }
+        intern_stats.print("  Internalizer: client order → find firm matches");
+        std::cout << "  ✅ btree price index + node_hash_map for stable Order refs\n\n";
+    }
+
+    // ── UC7: Risk Limits Table ────────────────────────────────────────────
+    {
+        std::cout << "──────────────────────────────────────────────────────────\n";
+        std::cout << "UC7: Pre-Trade Risk — Limits Check\n";
+        std::cout << "  Container: flat_hash_map<uint32_t, RiskLimits>\n";
+        std::cout << "  Use: Every order goes through risk check before routing\n";
+        std::cout << "  Requirement: ADD <50ns to order path\n\n";
+
+        absl::flat_hash_map<uint32_t, RiskLimits> risk_table;
+        risk_table.reserve(256); // 256 desks
+
+        for (uint32_t desk = 0; desk < 32; ++desk) {
+            RiskLimits rl{};
+            rl.max_position_fp  = to_fp(10'000'000.0); // $10M notional
+            rl.max_pnl_loss_fp  = to_fp(-500'000.0);   // -$500K daily loss limit
+            rl.max_order_qty    = 10000;
+            rl.max_order_rate   = 1000; // 1K orders/sec
+            rl.hard_kill        = 0;
+            risk_table.emplace(desk, rl);
+        }
+
+        // Hot path: pre-trade risk check (called on EVERY order)
+        LatencyStats risk_stats;
+        for (int iter = 0; iter < 500000; ++iter) {
+            uint32_t desk_id = iter % 32;
+            uint32_t order_qty = 100 + (iter % 1000);
+            auto ns = measure_latency_ns([&]() {
+                auto it = risk_table.find(desk_id);
+                if (it == risk_table.end()) return;
+                const auto& lim = it->second;
+                volatile bool ok = (lim.hard_kill == 0 &&
+                                    order_qty <= lim.max_order_qty);
+            });
+            risk_stats.add(ns);
+        }
+        risk_stats.print("  Pre-trade risk: limit lookup + check (32 desks)");
+        std::cout << "  ✅ flat_hash_map: risk check adds <30ns to order path\n";
+    }
+}
+
+//=============================================================================
+// 8. ABSEIL SPAN — ZERO-COPY MARKET DATA VIEWS
+//=============================================================================
+
+void demo_absl_span() {
+    std::cout << "\n╔════════════════════════════════════════════════════════════╗\n";
+    std::cout << "║  ABSL::SPAN — ZERO-COPY DATA VIEWS                         ║\n";
+    std::cout << "╚════════════════════════════════════════════════════════════╝\n\n";
+
+    std::cout << "absl::Span<T>: non-owning view into contiguous data.\n";
+    std::cout << "  • No allocation, no copy — just (ptr, length)\n";
+    std::cout << "  • Use instead of (T*, size_t) pairs everywhere\n";
+    std::cout << "  • Identical to std::span (C++20) but works on C++17+RHEL\n\n";
+
+    std::cout << "Trading uses:\n";
+    std::cout << "  • Span<BasketLeg>: ETF component slice into pre-alloc array\n";
+    std::cout << "  • Span<Order>: view into ring buffer without copy\n";
+    std::cout << "  • Span<uint8_t>: raw packet bytes from NIC — zero copy\n";
+    std::cout << "  • Span<MarketData>: market data snapshot window\n\n";
+
+    // Demo: process market data packet as Span (zero-copy from ring buffer)
+    static std::array<MarketData, 256> tick_buffer{};
+    for (size_t i = 0; i < 256; ++i) {
+        tick_buffer[i] = MarketData(i, i % 100, 99.95, 100.05, 100, 100);
+    }
+
+    // Span = view into tick_buffer[64..128] — no copy, no allocation
+    absl::Span<MarketData> window(tick_buffer.data() + 64, 64);
+
+    LatencyStats span_stats;
+    for (int iter = 0; iter < 100000; ++iter) {
+        auto ns = measure_latency_ns([&]() {
+            int64_t sum_bid = 0;
+            for (const auto& md : window) {  // iterates pointer range - zero overhead
+                sum_bid += md.bid_fp;
+            }
+            volatile int64_t r = sum_bid;
+        });
+        span_stats.add(ns);
+    }
+    span_stats.print("  Span<MarketData>: iterate 64 ticks (zero copy)");
+
+    std::cout << "\n  Code pattern:\n";
+    std::cout << "    // Pre-allocated pool at startup:\n";
+    std::cout << "    static std::array<BasketLeg, 50000> leg_pool{};\n";
+    std::cout << "    // Span = view into pool slice:\n";
+    std::cout << "    absl::Span<BasketLeg> spy_legs(leg_pool.data(), 503);\n";
+    std::cout << "    // Store in map: zero copy, no extra allocation:\n";
+    std::cout << "    baskets.emplace(SPY_ID, spy_legs);\n";
+}
+
+//=============================================================================
+// 9. CUSTOM HASH FOR ULL — INTEGER KEY BEST PRACTICES
+//=============================================================================
+
+void demo_custom_hash() {
+    std::cout << "\n╔════════════════════════════════════════════════════════════╗\n";
+    std::cout << "║  CUSTOM HASH FUNCTIONS FOR ULL                             ║\n";
+    std::cout << "╚════════════════════════════════════════════════════════════╝\n\n";
+
+    std::cout << "Key insight: hash performance depends on KEY TYPE:\n";
+    std::cout << "  uint32_t/uint64_t : 1 cycle (multiply + shift)\n";
+    std::cout << "  double             : 1 cycle (reinterpret_cast to uint64_t)\n";
+    std::cout << "  std::string        : N cycles (strlen + loop) — AVOID on hot path\n";
+    std::cout << "  struct             : ~sizeof(struct)/8 cycles\n\n";
+
+    std::cout << "HFT recommendation: ALWAYS use integer symbol IDs, never strings\n";
+    std::cout << "  • Assign uint32_t IDs at startup from symbol list file\n";
+    std::cout << "  • Or pack 8-char ticker into uint64_t:\n";
+    std::cout << "      uint64_t pack = 0;\n";
+    std::cout << "      memcpy(&pack, \"AAPL    \", 8);  // zero-padded\n\n";
+
+    // Benchmark: integer key vs packed-string key
+    constexpr size_t N = 500; // typical index universe
+    absl::flat_hash_map<uint32_t, double> int_map;
+    int_map.reserve(512);
+
+    absl::flat_hash_map<uint64_t, double> packed_map;
+    packed_map.reserve(512);
+
+    // Populate both
+    for (uint32_t i = 0; i < N; ++i) {
+        int_map.emplace(i, 1.0 / N);
+        uint64_t packed = static_cast<uint64_t>(i) * 0x100000001ULL; // fake packed
+        packed_map.emplace(packed, 1.0 / N);
+    }
+
+    LatencyStats int_stats, packed_stats;
+    std::mt19937 rng(123);
+    for (int iter = 0; iter < 200000; ++iter) {
+        uint32_t key = rng() % N;
+        auto ns = measure_latency_ns([&]() {
+            volatile auto it = int_map.find(key);
+        });
+        int_stats.add(ns);
+
+        uint64_t pk = static_cast<uint64_t>(key) * 0x100000001ULL;
+        ns = measure_latency_ns([&]() {
+            volatile auto it = packed_map.find(pk);
+        });
+        packed_stats.add(ns);
+    }
+
+    int_stats.print("    flat_hash_map<uint32_t>: lookup");
+    packed_stats.print("    flat_hash_map<uint64_t>: lookup (packed symbol)");
+    std::cout << "  ✅ Both are fast. Integer key is king in HFT hot paths.\n";
+}
+
+//=============================================================================
 // MAIN BENCHMARK RUNNER
 //=============================================================================
 
@@ -841,30 +1411,57 @@ int main() {
     std::cout << "╔════════════════════════════════════════════════════════════╗\n";
     std::cout << "║                                                            ║\n";
     std::cout << "║      ABSEIL CONTAINERS COMPREHENSIVE BENCHMARK             ║\n";
-    std::cout << "║      Google's High-Performance C++ Containers              ║\n";
-    std::cout << "║                                                            ║\n";
+    std::cout << "║      Google High-Performance C++ Containers                ║\n";
+    std::cout << "║      RHEL 8/9 (GCC 8+) + macOS Compatible                 ║\n";
     std::cout << "╚════════════════════════════════════════════════════════════╝\n";
 
     std::cout << "\nSystem Information:\n";
-    std::cout << "  CPU Cores: " << std::thread::hardware_concurrency() << "\n";
-    std::cout << "  Date: February 2026\n";
-    std::cout << "  Target: Sub-microsecond latency for HFT\n";
+    std::cout << "  CPU Cores : " << std::thread::hardware_concurrency() << "\n";
+    std::cout << "  Platform  : "
+#ifdef __linux__
+              << "Linux/RHEL\n";
+#elif defined(__APPLE__)
+              << "macOS (dev)\n";
+#else
+              << "Other\n";
+#endif
+    std::cout << "  Target    : Sub-microsecond latency — HFT front-office\n\n";
+
+    std::cout << "Swiss Table SIMD internals (flat_hash_map):\n";
+    std::cout << "  • 16 slots per group, ctrl bytes = 16×1B in one cache line\n";
+    std::cout << "  • Lookup: H1→group, SIMD(ctrl, H2) → match mask, then key cmp\n";
+    std::cout << "  • Avg 0-1 cache line reads per lookup (vs 2-3 for unordered_map)\n";
+    std::cout << "  • SIMD: SSE2/NEON 16-way parallel search\n\n";
 
     benchmark_abseil_hash_containers();
     benchmark_abseil_btree_containers();
     benchmark_abseil_sequential_containers();
     practical_trading_examples();
+    advanced_trading_use_cases();
+    demo_absl_span();
+    demo_custom_hash();
     print_comparison_table();
     print_best_practices();
 
     std::cout << "\n╔════════════════════════════════════════════════════════════╗\n";
-    std::cout << "║  Benchmark Complete!                                       ║\n";
+    std::cout << "║  Benchmark Complete! All use cases covered.                ║\n";
     std::cout << "╚════════════════════════════════════════════════════════════╝\n\n";
 
     std::cout << "📚 Resources:\n";
-    std::cout << "  • Abseil Docs: https://abseil.io/docs/cpp/guides/container\n";
-    std::cout << "  • Swiss Tables Paper: https://abseil.io/about/design/swisstables\n";
-    std::cout << "  • GitHub: https://github.com/abseil/abseil-cpp\n\n";
+    std::cout << "  Abseil Containers  : https://abseil.io/docs/cpp/guides/container\n";
+    std::cout << "  Swiss Tables paper : https://abseil.io/about/design/swisstables\n";
+    std::cout << "  B-tree design      : https://abseil.io/about/design/btree\n";
+    std::cout << "  GitHub             : https://github.com/abseil/abseil-cpp\n";
+    std::cout << "  RHEL build         : See file header for cmake + dnf instructions\n\n";
+
+    std::cout << "Container selection cheat-sheet for HFT:\n";
+    std::cout << "  flat_hash_map  → symbol/order/venue lookup (15-60ns, no ordering)\n";
+    std::cout << "  node_hash_map  → orders where you store iterators/pointers\n";
+    std::cout << "  btree_map      → price levels, dark pool book, range queries\n";
+    std::cout << "  btree_multimap → multi-order at same price (dark pool, queue)\n";
+    std::cout << "  InlinedVector  → orders at a price level (usually <8 orders)\n";
+    std::cout << "  FixedArray     → VWAP rolling buffer, fixed-size time windows\n";
+    std::cout << "  Span           → zero-copy ETF basket, raw NIC packet view\n\n";
 
     return 0;
 }
