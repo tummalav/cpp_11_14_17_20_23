@@ -41,6 +41,7 @@
 #include <numeric>
 #include <climits>
 #include <deque>
+#include <span>
 #include <type_traits>
 #include <pthread.h>
 #include <sched.h>
@@ -48,10 +49,24 @@
 #  include <sys/mman.h>
 #  include <sys/resource.h>
 #endif
-#include "absl/container/flat_hash_map.h"
-#include "absl/container/btree_map.h"
-#include "absl/container/inlined_vector.h"
-#include "absl/types/span.h"
+#ifdef HAVE_ABSEIL
+#  include "absl/container/flat_hash_map.h"
+#  include "absl/container/btree_map.h"
+#  include "absl/container/inlined_vector.h"
+#  include "absl/types/span.h"
+namespace ull_map {
+    template<class K, class V> using flat_hash_map = absl::flat_hash_map<K, V>;
+    template<class K, class V> using btree_map     = absl::btree_map<K, V>;
+}
+#else
+#  include <unordered_map>
+#  include <map>
+#  include <vector>
+namespace ull_map {
+    template<class K, class V> using flat_hash_map = std::unordered_map<K, V>;
+    template<class K, class V> using btree_map     = std::map<K, V>;
+}
+#endif
 
 // ── Platform ─────────────────────────────────────────────────────────────────
 #if defined(__x86_64__)
@@ -323,7 +338,7 @@ struct FairValueEngine {
     // ── Fair value with discrete known dividends ──────────────────────────
     // divs = vector of (days_to_div, div_amount)
     static double index_future_fair_div(double spot, double r, double T,
-        absl::Span<const std::pair<double,double>> divs) noexcept {
+        std::span<const std::pair<double,double>> divs) noexcept {
         double pv_divs = 0.0;
         for (const auto& [t, div] : divs)
             pv_divs += div * std::exp(-r * t);
@@ -346,9 +361,9 @@ struct FairValueEngine {
     }
 
     // ── iNAV bottom-up (full sum) ──────────────────────────────────────────
-    static double inav(absl::Span<const double> weights,
-                       absl::Span<const double> mids,
-                       absl::Span<const double> fx_rates,
+    static double inav(std::span<const double> weights,
+                       std::span<const double> mids,
+                       std::span<const double> fx_rates,
                        double cash, double etf_shares_per_cu) noexcept {
         const size_t n = std::min({weights.size(), mids.size(), fx_rates.size()});
         double sum = cash;
@@ -409,6 +424,18 @@ struct FairValueEngine {
  │ HEDGEINSTRUMENT    │ F,B,N       │ ★★★★☆ F=futures (fast,liquid,cheap).   │
  │                    │             │   B=basket (exact,slow,expensive).     │
  │                    │             │   F preferred for intraday hedging.    │
+ └────────────────────┴─────────────┴────────────────────────────────────────┘
+
+ ┌──────────────────────────────────────────────────────────────────────────────
+ │ HKEX-SPECIFIC SPREAD CONSTRAINTS (SFC Regulatory Requirement)
+ ├────────────────────┬─────────────┬────────────────────────────────────────┤
+ │ Symbol             │ Max Spread  │ Notes                                  │
+ ├────────────────────┼─────────────┼────────────────────────────────────────┤
+ │ 2800 (HSI Tracker) │ 40 bps total│ MAX_SPREAD_BPS=20 (20 bps each side)  │
+ │ 2828 (HSCEI ETF)   │ 40 bps total│ MAX_SPREAD_BPS=20 (20 bps each side)  │
+ │ 2823 (iShares A50) │ 40 bps total│ MAX_SPREAD_BPS=20 (FX risk: widen base)│
+ ├────────────────────┼─────────────┼────────────────────────────────────────┤
+ │ Dual Counter B     │ 40 bps total│ B_SPREAD_BPS ≤ 20 (block/institutional)│
  └────────────────────┴─────────────┴────────────────────────────────────────┘
 
  ┌──────────────────────────────────────────────────────────────────────────────
@@ -503,11 +530,11 @@ struct FairValueEngine {
 
 struct DualCounterConfig {
     // Counter A (lit venue) parameters
-    static constexpr int64_t  A_SPREAD_BPS       = 4;    // 0.4 bps each side
+    static constexpr int64_t  A_SPREAD_BPS       = 4;    // 4 bps each side = 8 bps total
     static constexpr uint32_t A_QUOTE_SIZE        = 1000;
     static constexpr uint8_t  A_VENUE_ID          = 1;   // e.g. NYSE
     // Counter B (dark pool) parameters
-    static constexpr int64_t  B_SPREAD_BPS        = 10;  // 1 bps each side
+    static constexpr int64_t  B_SPREAD_BPS        = 10;  // 10 bps each side = 20 bps total
     static constexpr uint32_t B_QUOTE_SIZE        = 5000; // larger block size
     static constexpr uint8_t  B_VENUE_ID          = 2;   // e.g. IEX dark
     // Net position management
@@ -517,6 +544,29 @@ struct DualCounterConfig {
     static constexpr int64_t  HEDGE_THRESHOLD_QTY = 5000; // hedge when abs(net) > 5K
     static constexpr int64_t  SKEW_BPS_PER_LOT    = 1;
     static constexpr uint32_t FUTURES_INST_ID      = 9999;
+    static constexpr bool     ENABLE_INTERNAL_CROSS = true;
+};
+
+// ── HKEX Dual Counter config (2800 / 2828 / 2823) ────────────────────────────
+// HKEX SFC mandate: max quoted spread ≤ 40 bps total (= 20 bps each side)
+// Counter A: lit HKEX Main Board (tight, competes with algos)
+// Counter B: HKEX Block Trade / OTC-reported (wider, attracts institutional flow)
+struct HkexDualCounterConfig {
+    // Counter A — HKEX lit Main Board (inside spread, ~half the max)
+    static constexpr int64_t  A_SPREAD_BPS       = 5;    // 5 bps each side = 10 bps total
+    static constexpr uint32_t A_QUOTE_SIZE        = 5000; // 10 board lots (500 share lot)
+    static constexpr uint8_t  A_VENUE_ID          = 10;  // HKEX Main Board
+    // Counter B — HKEX Block (wider, attracts institutional; still ≤ 40 bps total)
+    static constexpr int64_t  B_SPREAD_BPS        = 20;  // 20 bps each side = 40 bps total (SFC max)
+    static constexpr uint32_t B_QUOTE_SIZE        = 50000; // 100 board lots (block size)
+    static constexpr uint8_t  B_VENUE_ID          = 11;  // HKEX Block Trade facility
+    // Position limits
+    static constexpr int64_t  MAX_LONG_QTY        = 200000;
+    static constexpr int64_t  MAX_SHORT_QTY       = 200000;
+    static constexpr int64_t  CROSS_THRESHOLD_QTY = 1000;
+    static constexpr int64_t  HEDGE_THRESHOLD_QTY = 10000;
+    static constexpr int64_t  SKEW_BPS_PER_LOT    = 1;
+    static constexpr uint32_t FUTURES_INST_ID      = 8001; // HSI Futures
     static constexpr bool     ENABLE_INTERNAL_CROSS = true;
 };
 
@@ -1113,8 +1163,8 @@ int main() {
     const std::array<double,5> mids     = {189.51,335.12,3510.25,140.22,175.82};
     const std::array<double,5> fx_rates = {1.0,1.0,1.0,1.0,1.0};
     const double inav_val = FairValueEngine::inav(
-        absl::MakeConstSpan(weights), absl::MakeConstSpan(mids),
-        absl::MakeConstSpan(fx_rates), 0.0, 1.0);
+        std::span(weights), std::span(mids),
+        std::span(fx_rates), 0.0, 1.0);
     std::cout << "  iNAV (5-stock wt) : " << inav_val << "\n";
     const double inav_topdown = FairValueEngine::inav_topdown(5280.0, 1.0/10.0, 1.0, 0.02);
     std::cout << "  iNAV top-down (SPX/10): " << inav_topdown << "\n";

@@ -17,7 +17,7 @@
  *   ✓ SeqLock for shared state (iNAV, ref prices) — writer never blocks
  *   ✓ SPSC wait-free rings                        — zero lock, 10-50ns
  *   ✓ __builtin_prefetch                          — L1 pre-warm next slot
- *   ✓ absl::flat_hash_map                         — Swiss table, 15-60ns
+ *   ✓ ull_map::flat_hash_map                         — Swiss table, 15-60ns
  *   ✓ Solarflare ef_vi / OpenOnload stubs         — kernel-bypass NIC
  *   ✓ mlockall + pthread_setaffinity_np           — RHEL ULL setup
  *   ✓ _GNU_SOURCE                                 — RHEL/Linux compat
@@ -72,11 +72,25 @@
 #  include <sys/resource.h>
 #endif
 
-// ─── Abseil (installed: brew install abseil / dnf build from source) ─────────
-#include "absl/container/flat_hash_map.h"
-#include "absl/container/btree_map.h"
-#include "absl/container/inlined_vector.h"
-#include "absl/types/span.h"
+// ─── Abseil (optional: brew install abseil / dnf build from source) ──────────
+#ifdef HAVE_ABSEIL
+#  include "absl/container/flat_hash_map.h"
+#  include "absl/container/btree_map.h"
+#  include "absl/container/inlined_vector.h"
+#  include "absl/types/span.h"
+namespace ull_map {
+    template<class K, class V> using flat_hash_map = ull_map::flat_hash_map<K, V>;
+    template<class K, class V> using btree_map     = ull_map::btree_map<K, V>;
+}
+#else
+#  include <unordered_map>
+#  include <map>
+#  include <vector>
+namespace ull_map {
+    template<class K, class V> using flat_hash_map = std::unordered_map<K, V>;
+    template<class K, class V> using btree_map     = std::map<K, V>;
+}
+#endif
 
 // ============================================================================
 // SECTION 0 — PLATFORM MACROS & COMPILE-TIME CONSTANTS
@@ -391,7 +405,7 @@ class iNavEngine {
     CACHE_ALIGN std::array<uint32_t,MaxLegs> symbol_ids_{}; // instrument IDs
 
     // Symbol ID → leg index lookup (flat_hash_map: 15-60ns)
-    absl::flat_hash_map<uint32_t, uint32_t> sym_to_leg_;
+    ull_map::flat_hash_map<uint32_t, uint32_t> sym_to_leg_;
 
     uint32_t n_legs_{0};
     double   shares_outstanding_{1.0};
@@ -525,7 +539,7 @@ protected:
     const SeqLock<iNavState>* inav_lock_{nullptr};
 
     // Per-strategy position table (flat_hash_map: pre-sized, no rehash)
-    absl::flat_hash_map<uint32_t, Position> positions_;
+    ull_map::flat_hash_map<uint32_t, Position> positions_;
 
     // Order submission ring to gateway thread (SPSC, wait-free)
     SpscRing<Order, 256>* order_ring_{nullptr};
@@ -626,8 +640,11 @@ protected:
 //   - iNAV_ask used for our ETF bid
 //
 // KEY PARAMETERS:
-//   BASE_SPREAD_BPS    — minimum half-spread to quote (e.g. 5 bps = 0.05%)
-//   MAX_SPREAD_BPS     — maximum spread (widen in volatile/illiquid markets)
+//   BASE_SPREAD_BPS    — minimum half-spread to quote (each side, in bps)
+//                        e.g. BASE_SPREAD_BPS=2 → 2 bps each side = 4 bps total
+//   MAX_SPREAD_BPS     — maximum half-spread (each side) in bps
+//                        HKEX SFC mandate: max total quoted spread ≤ 40 bps
+//                        → MAX_SPREAD_BPS = 20 (20 bps each side = 40 bps total)
 //   TARGET_INVENTORY   — desired net position (usually 0 = flat)
 //   MAX_LONG_QTY       — risk limit: max long ETF shares held
 //   MAX_SHORT_QTY      — risk limit: max short ETF shares held
@@ -647,19 +664,76 @@ protected:
 //     - 'B': Send basket of constituent orders (full replication hedge)
 //   Hedge ratio = 1.0 (delta-1 ETF vs identical basket)
 
+// ── Generic ETF MM config (default / non-HKEX) ───────────────────────────────
 struct EtfMMConfig {
-    static constexpr int64_t  BASE_SPREAD_BPS     = 5;    // 0.5 bps each side
-    static constexpr int64_t  MAX_SPREAD_BPS      = 50;   // 5 bps each side max
-    static constexpr int64_t  MIN_EDGE_BPS        = 2;    // must have 0.2 bps edge
-    static constexpr int64_t  SKEW_BPS_PER_LOT    = 1;    // 0.1 bps skew per lot
+    static constexpr int64_t  BASE_SPREAD_BPS     = 3;    // 3 bps each side = 6 bps total
+    static constexpr int64_t  MAX_SPREAD_BPS      = 20;   // 20 bps each side = 40 bps total
+    static constexpr int64_t  MIN_EDGE_BPS        = 1;    // 1 bps minimum edge vs iNAV
+    static constexpr int64_t  SKEW_BPS_PER_LOT    = 1;    // 1 bps skew per 100-share lot
     static constexpr int64_t  MAX_LONG_QTY        = 50000;
     static constexpr int64_t  MAX_SHORT_QTY       = 50000;
     static constexpr uint32_t QUOTE_SIZE          = 1000; // ETF shares per side
     static constexpr uint32_t HEDGE_THRESHOLD_QTY = 5000; // hedge when abs(inv) > 5K
     static constexpr char     HEDGE_INSTRUMENT    = 'F';  // 'F'=futures
     static constexpr bool     ENABLE_FADE         = true;
-    static constexpr int64_t  FADE_FACTOR_BPS     = 3;    // fade 0.3 bps on imbalance
+    static constexpr int64_t  FADE_FACTOR_BPS     = 2;    // 2 bps fade on order imbalance
     static constexpr uint32_t FUTURES_INST_ID     = 9999; // e.g. ES1 contract
+};
+
+// ── HKEX 2800 (Tracker Fund / HSI ETF) ───────────────────────────────────────
+// Board lot: 500 shares | tick: HK$0.05 (price 20-100) | AUM ~HK$100B
+// Hedge: HSI Futures (HKFE) | Liquidity: very high → tight spread
+// HKEX SFC mandate: max quoted spread ≤ 40 bps (half = 20 bps each side)
+struct Hkex2800Config {
+    static constexpr int64_t  BASE_SPREAD_BPS     = 2;    // 2 bps each side = 4 bps total
+    static constexpr int64_t  MAX_SPREAD_BPS      = 20;   // 20 bps each side = 40 bps total (HKEX SFC max)
+    static constexpr int64_t  MIN_EDGE_BPS        = 1;    // 1 bps min edge
+    static constexpr int64_t  SKEW_BPS_PER_LOT    = 1;    // 1 bps per lot (500 shares)
+    static constexpr int64_t  MAX_LONG_QTY        = 200000; // HK$4M at HK$20/share
+    static constexpr int64_t  MAX_SHORT_QTY       = 200000;
+    static constexpr uint32_t QUOTE_SIZE          = 10000;  // 10K shares = 20 board lots
+    static constexpr uint32_t HEDGE_THRESHOLD_QTY = 10000;  // hedge >10K (1 HSI fut ≈ 36K shares)
+    static constexpr char     HEDGE_INSTRUMENT    = 'F';    // HSI Futures (HKFE)
+    static constexpr bool     ENABLE_FADE         = true;
+    static constexpr int64_t  FADE_FACTOR_BPS     = 3;      // 3 bps on imbalance (open/close)
+    static constexpr uint32_t FUTURES_INST_ID     = 8001;   // HSI near-month future
+};
+
+// ── HKEX 2828 (H-Share ETF / HSCEI) ─────────────────────────────────────────
+// Board lot: 200 shares | tick: HK$0.02 (price 5-20) | AUM ~HK$30B
+// Hedge: HSCEI Futures (HHI, HKFE) | More volatile than 2800
+struct Hkex2828Config {
+    static constexpr int64_t  BASE_SPREAD_BPS     = 4;    // 4 bps each side = 8 bps total (more volatile)
+    static constexpr int64_t  MAX_SPREAD_BPS      = 20;   // 20 bps each side = 40 bps total (HKEX SFC max)
+    static constexpr int64_t  MIN_EDGE_BPS        = 2;    // 2 bps min edge
+    static constexpr int64_t  SKEW_BPS_PER_LOT    = 2;    // 2 bps per lot (more aggressive skew)
+    static constexpr int64_t  MAX_LONG_QTY        = 100000;
+    static constexpr int64_t  MAX_SHORT_QTY       = 100000;
+    static constexpr uint32_t QUOTE_SIZE          = 5000;  // 5K shares
+    static constexpr uint32_t HEDGE_THRESHOLD_QTY = 5000;
+    static constexpr char     HEDGE_INSTRUMENT    = 'F';   // HSCEI Futures (HHI)
+    static constexpr bool     ENABLE_FADE         = true;
+    static constexpr int64_t  FADE_FACTOR_BPS     = 4;     // 4 bps on imbalance
+    static constexpr uint32_t FUTURES_INST_ID     = 8002;  // HSCEI (HHI) near-month future
+};
+
+// ── HKEX 2823 (iShares A50 ETF — cross-border CNH/HKD) ───────────────────────
+// Board lot: 100 shares | tick: HK$0.01 | Underlying: FTSE China A50 (CNY)
+// FX risk: CNH/HKD conversion on every tick | Hedge: SGX A50 Futures
+// Wider spread justified by FX uncertainty + Stock Connect quota risk
+struct Hkex2823Config {
+    static constexpr int64_t  BASE_SPREAD_BPS     = 6;    // 6 bps each side = 12 bps total (FX risk)
+    static constexpr int64_t  MAX_SPREAD_BPS      = 20;   // 20 bps each side = 40 bps total (HKEX SFC max)
+    static constexpr int64_t  MIN_EDGE_BPS        = 3;    // 3 bps min edge (FX slippage buffer)
+    static constexpr int64_t  SKEW_BPS_PER_LOT    = 2;    // 2 bps per lot
+    static constexpr int64_t  MAX_LONG_QTY        = 50000;
+    static constexpr int64_t  MAX_SHORT_QTY       = 50000;
+    static constexpr uint32_t QUOTE_SIZE          = 2000;  // 2K shares
+    static constexpr uint32_t HEDGE_THRESHOLD_QTY = 2000;
+    static constexpr char     HEDGE_INSTRUMENT    = 'F';   // SGX A50 Futures
+    static constexpr bool     ENABLE_FADE         = true;
+    static constexpr int64_t  FADE_FACTOR_BPS     = 5;     // 5 bps on imbalance (CNH fix event)
+    static constexpr uint32_t FUTURES_INST_ID     = 8003;  // SGX FTSE China A50 future
 };
 
 template<typename Config = EtfMMConfig>
@@ -695,8 +769,9 @@ public:
         const int64_t fair_fp = inav.inav_fp;
 
         // ── 2. Spread calculation ──────────────────────────────────────
-        // Base spread
-        int64_t half_spread_fp = bps_to_fp(Config::BASE_SPREAD_BPS, fair_fp) / BPS_SCALE;
+        // bps_to_fp(N, ref) = ref * N / BPS_SCALE → exact bps fraction
+        // half_spread = BASE_SPREAD_BPS bps of fair_fp
+        int64_t half_spread_fp = bps_to_fp(Config::BASE_SPREAD_BPS, fair_fp);
 
         // Volatility scaling: widen spread when vol is high
         update_ewma_vol(fair_fp);
@@ -704,16 +779,16 @@ public:
             // Bid-ask imbalance fade: if more sellers → widen ask
             const int64_t imbalance = t.ask_qty - t.bid_qty;
             if (__builtin_expect(imbalance > 0, 0))
-                half_spread_fp += bps_to_fp(Config::FADE_FACTOR_BPS, fair_fp) / BPS_SCALE;
+                half_spread_fp += bps_to_fp(Config::FADE_FACTOR_BPS, fair_fp);
         }
         half_spread_fp = std::min(half_spread_fp,
-            bps_to_fp(Config::MAX_SPREAD_BPS, fair_fp) / BPS_SCALE);
+            bps_to_fp(Config::MAX_SPREAD_BPS, fair_fp));
 
         // ── 3. Inventory skew ──────────────────────────────────────────
         // If long ETF → widen bid (discourage more buys) + tighten ask (encourage sells)
         const int64_t inv = this->net_qty(this->inst_id_);
         const int64_t skew_fp = bps_to_fp(
-            Config::SKEW_BPS_PER_LOT * (inv / 100), fair_fp) / BPS_SCALE;
+            Config::SKEW_BPS_PER_LOT * (inv / 100), fair_fp);
 
         // ── 4. Build quotes ────────────────────────────────────────────
         // iNAV_ask used for ETF bid (we buy ETF → sell basket at ask → use ask-iNAV)
@@ -1161,7 +1236,7 @@ class BasketStrategy : public StrategyBase<BasketStrategy<Config>, Config> {
     int64_t  basket_value_fp_{0};   // real-time basket theoretical value
     int64_t  target_notional_fp_{0};// total notional to deploy
 
-    absl::flat_hash_map<uint32_t, uint32_t> sym_to_leg_;
+    ull_map::flat_hash_map<uint32_t, uint32_t> sym_to_leg_;
 
 public:
     COLD void configure(const std::vector<BasketLeg>& legs, double notional) noexcept {
@@ -1358,11 +1433,21 @@ int main() {
     static IndexArbitrager<IndexArbConfig>   idx_strategy;
     static BasketStrategy<BasketConfig>      basket_strategy;
 
+    // ── HKEX-specific instances (2800/2828/2823) ──────────────────────────
+    // MAX_SPREAD_BPS = 20 bps each side = 40 bps total (HKEX SFC mandate)
+    static EtfMarketMaker<Hkex2800Config>    hk2800_mm;  // HSI Tracker Fund
+    static EtfMarketMaker<Hkex2828Config>    hk2828_mm;  // H-Share / HSCEI ETF
+    static EtfMarketMaker<Hkex2823Config>    hk2823_mm;  // iShares A50 (CNH cross-border)
+
     mm_strategy.init    (&shared_inav, &order_ring, 1, 5000); // ETF inst_id=5000
     arb_strategy.init   (&shared_inav, &order_ring, 2, 5000);
     idx_strategy.init   (&shared_inav, &order_ring, 3, 9999);
     basket_strategy.init(&shared_inav, &order_ring, 4, 5001);
     basket_strategy.configure(legs, 10'000'000.0);
+
+    hk2800_mm.init(&shared_inav, &order_ring, 5, 2800); // HKEX:2800 — max spread 40 bps
+    hk2828_mm.init(&shared_inav, &order_ring, 6, 2828); // HKEX:2828 — max spread 40 bps
+    hk2823_mm.init(&shared_inav, &order_ring, 7, 2823); // HKEX:2823 — max spread 40 bps
 
     // ── Simulate a stream of market ticks ────────────────────────────────
     std::cout << "Simulating 1,000,000 market ticks across all strategies...\n";
