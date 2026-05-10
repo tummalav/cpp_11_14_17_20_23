@@ -1330,8 +1330,11 @@ int main() {
     };
 
     // ── iNAV engine (lives on its own thread in production) ─────────────
+    // shares_outstanding = 1.0 → iNAV = weighted basket price level (e.g. ~712)
+    // In production: use actual ETF shares_outstanding (e.g. SPY = 900M shares,
+    // creation unit = 50,000 shares → iNAV = [Σ(shares_i × price_i) + cash] / 50000)
     static iNavEngine<50> inav_engine;
-    inav_engine.configure(legs, 100'000'000.0, 50000.0, 3.0);
+    inav_engine.configure(legs, /*shares_outstanding=*/1.0, /*cash=*/0.0, /*cpu_ghz=*/3.0);
 
     // Read published iNAV
     iNavState inav{};
@@ -1368,15 +1371,17 @@ int main() {
     constexpr size_t N_TICKS = 1'000'000;
     for (size_t i = 0; i < N_TICKS; ++i) {
         Tick t;
-        t.symbol_id = 5000 + (i % 5);      // ETF or constituent
+        // symbol IDs: 5000=ETF 1001-1005=constituents 8888=basket/spot 9999=futures
+        const uint32_t sym_cycle[] = {5000,1001,1002,1003,1004,1005,8888,9999};
+        t.symbol_id = sym_cycle[i % 8];
         t.bid_fp = to_fp(100.0 + (i % 100) * 0.01);
         t.ask_fp = t.bid_fp + to_fp(0.02);
         t.recv_tsc = rdtsc();
         t.bid_qty  = 1000;
         t.ask_qty  = 1000;
 
-        // Update iNAV engine on constituent ticks
-        if (t.symbol_id != 5000) inav_engine.on_tick(t);
+        // Update iNAV engine on constituent ticks (sym_ids 1001-1005)
+        if (t.symbol_id >= 1001 && t.symbol_id <= 1005) inav_engine.on_tick(t);
 
         // Fan-out to all strategies (in production: SPMCBroadcast ring)
         mm_strategy.on_tick(t);
