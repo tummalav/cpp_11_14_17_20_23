@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Build output directories
 cmake-build-debug/
 cmake-build-release/
@@ -6,6 +7,21 @@ out/
 
 # Compiled binaries (no extension on macOS/Linux)
 # Keep named binaries like aba_demo, lockfree_benchmark etc. tracked explicitly
+*.o
+*.d
+*.a
+*.so
+*.so.*
+*.xcodeproj/
+*.dylib
+# Build output directories
+Makefile
+*.cmake
+
+out/
+# IDE files
+.idea/
+# Compiled object / library files
 *.o
 *.d
 *.a
@@ -20,15 +36,71 @@ cmake_install.cmake
 Makefile
 *.cmake
 
-# IDE files
-.idea/
 .vscode/
 *.xcodeproj/
 
 # macOS
 .DS_Store
+=======
+cpp_11_14_17_20_23/01_cpp_features/general/const_evolution
+03_trading_apps/orderbook/ull_orderbook
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.iws
+.classpath
+.project
+.settings/
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+cmake-build-debug/
+cmake-build-release/
+*.dSYM/
+
+# Compiled binaries (no extension = Linux/macOS executables)
+cpp_11_14_17_20_23/03_trading_apps/vwap_algo_engine
+cpp_11_14_17_20_23/03_trading_apps/market_making/mm_strategies
+cpp_11_14_17_20_23/03_trading_apps/market_making/ull_etf_strategies
+cpp_11_14_17_20_23/03_trading_apps/market_making/ull_pair_strategies
+cpp_11_14_17_20_23/03_trading_apps/market_making/ull_missing_strategies
+
+# Java
+*.class
+*.jar
+target/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+>>>>>>> 79043eb (Initial commit — C++/Java trading systems, ULL strategies, market making engines)
 
 # Logs
 *.log
 
+<<<<<<< HEAD
 03_trading_apps/orderbook/ull_orderbook
+=======
+# Resumes, Cover Letters, and personal documents
+*.docx
+*.pdf
+CV_*.md
+CoverLetter_*.md
+"Resume Description"
+Resume Description
+.git_backup
+>>>>>>> 79043eb (Initial commit — C++/Java trading systems, ULL strategies, market making engines)
