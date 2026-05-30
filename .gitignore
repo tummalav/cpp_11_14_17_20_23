@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Build output directories
 cmake-build-debug/
 cmake-build-release/
@@ -41,7 +40,6 @@ Makefile
 
 # macOS
 .DS_Store
-=======
 cpp_11_14_17_20_23/01_cpp_features/general/const_evolution
 03_trading_apps/orderbook/ull_orderbook
 # macOS
@@ -87,14 +85,11 @@ __pycache__/
 *.pyd
 .env
 .venv
->>>>>>> 79043eb (Initial commit — C++/Java trading systems, ULL strategies, market making engines)
 
 # Logs
 *.log
 
-<<<<<<< HEAD
 03_trading_apps/orderbook/ull_orderbook
-=======
 # Resumes, Cover Letters, and personal documents
 *.docx
 *.pdf
@@ -103,4 +98,3 @@ CoverLetter_*.md
 "Resume Description"
 Resume Description
 .git_backup
->>>>>>> 79043eb (Initial commit — C++/Java trading systems, ULL strategies, market making engines)
