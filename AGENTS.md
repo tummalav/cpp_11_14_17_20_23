@@ -16,7 +16,7 @@ These two purposes coexist in the same repo but serve different audiences. Treat
 01_cpp_features/cpp{11,14,17,20,23}/   Standalone feature demos (each file self-contained)
 01_cpp_features/general/               Templates, SFINAE, constexpr, design patterns
 02_ultra_low_latency/
-  core/          CPU affinity, NUMA, latency benchmarking
+  core/          CPU affinity, NUMA, latency benchmarking, trading pipeline docs
   lockfree/      Ring buffers, ABA problem, lock-free IPC over shared memory
   networking/    Low-latency network I/O
   containers/    Cache-friendly containers
@@ -49,13 +49,17 @@ Use `compile_cpp20.sh` — auto-detects best available standard (C++20 → C++17
 ./compile_cpp20.sh 01_cpp_features/cpp20/cpp20_concepts_use_cases_examples.cpp
 ```
 
+`build_scripts/run_benchmarks.sh` runs from the repo root and compiles/runs `quick_latency_test.cpp` and `latency_benchmarking_examples.cpp` (plus the optional atomic benchmark when present).
+
 Per-component benchmark build scripts live in `build_scripts/`:
 ```bash
 build_scripts/build_lockfree_benchmark.sh   # Lock-free ring buffers
 build_scripts/build_containers_benchmark.sh
 build_scripts/build_shm_ipc_benchmark.sh
 ```
-These scripts expect to be run **from the component's source directory** (they use relative paths).
+`build_scripts/build_abseil_benchmark.sh` and `build_scripts/build_folly_benchmark.sh` check/install their external deps before compiling `abseil_benchmark` / `folly_benchmark`.
+
+These scripts expect to be run **from the component's source directory** (they use relative paths); the exchange-handler subdirectories (`03_trading_apps/exchange_handlers/{asx_ouch,hkex_ocg,hkex_omd,nasdaq_itch}/build.sh`) are also standalone and run from their own directories.
 
 ---
 
@@ -69,11 +73,10 @@ These scripts expect to be run **from the component's source directory** (they u
 - Lock-free structures use `std::atomic` with explicit `memory_order`; never use `memory_order_seq_cst` in hot paths.
 
 ### Exchange Handler Pattern
-Each exchange handler follows:
-1. **Header-only protocol definition** (`*_order_handler.hpp`) with message structs and enums.
-2. **`.cpp` plugin** compiled as a shared library loaded at runtime via `dlopen`.
-3. **Plugin manager** (`ouch_plugin_manager.hpp`) provides a uniform `createXXXPlugin()` factory.
-4. Entry point: `plugin->initialize(json_config)` then `plugin->sendEnterOrder(order)`.
+Exchange handlers now split into two concrete shapes:
+1. **Order-entry plugins** such as `03_trading_apps/exchange_handlers/asx_ouch/ouch_asx_order_handler.hpp` and `03_trading_apps/exchange_handlers/hkex_ocg/hkex_ocg_order_handler.hpp` expose `initialize(...)`, session/login control, and order methods like `sendEnterOrder(...)`, `sendNewOrder(...)`, `sendCancelOrder(...)`, and `sendReplaceOrder(...)` plus `registerEventHandler(...)`.
+2. **Market-data feed handlers** such as `03_trading_apps/exchange_handlers/hkex_omd/hkex_omd_feed_handler.hpp` and `03_trading_apps/exchange_handlers/nasdaq_itch/nasdaq_itch_feed_handler.hpp` expose `connect(...)`, `subscribe(...)`, order-book access, and callback interfaces (`IOMDEventHandler`, CRTP-style `ITCHEventHandler`).
+3. Keep the header/implementation pair beside each protocol, and use the local `README.md` / `build.sh` in that protocol directory as the canonical usage/build entry point.
 
 ### C++ Standard Targets
 - Feature demos: use the standard being demonstrated; files are standalone.
@@ -91,8 +94,8 @@ Each exchange handler follows:
 
 | Component | Communicates Via |
 |---|---|
-| Exchange handlers | TCP sockets (OUCH/FIX/OCG binary protocols) |
-| Feed handlers → Orderbook | Lock-free SPSC ring buffer (shared memory or in-process) |
+| Exchange handlers | TCP sockets for order entry; multicast UDP/MoldUDP64 for market data |
+| Feed handlers → Orderbook | Lock-free SPSC ring buffer or callback delivery (shared memory or in-process) |
 | Orderbook → Strategy | Callback / lock-free queue, never blocking |
 | Risk checks | Inline on order submission path, not async |
 
@@ -103,6 +106,8 @@ Config for the OUCH plugin is JSON: `config/ouch_config.json.in` → `build/ouch
 ## Key Reference Files
 
 - `02_ultra_low_latency/core/ULTRA_LOW_LATENCY_ANALYSIS.md` — design rationale for ULL choices
+- `02_ultra_low_latency/core/LATENCY_BENCHMARKING_README.md` — benchmark suite details and `run_benchmarks.sh`
+- `02_ultra_low_latency/core/TRADING_PIPELINE_ARCHITECTURE.md` — end-to-end OMS/SOR/risk/execution pipeline
 - `02_ultra_low_latency/lockfree/LOCKFREE_SHM_IPC_GUIDE.md` — IPC ring buffer architecture
 - `03_trading_apps/exchange_handlers/asx_ouch/ASX_OUCH_ANALYSIS.md` — OUCH protocol deep-dive
 - `03_trading_apps/orderbook/JAVA_VS_CPP_ORDERBOOK.md` — design trade-offs

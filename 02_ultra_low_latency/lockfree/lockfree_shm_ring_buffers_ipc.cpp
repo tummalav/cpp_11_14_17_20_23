@@ -41,6 +41,7 @@
 // POSIX shared memory headers
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>   // waitpid — required on Linux (RHEL/Ubuntu); macOS pulls it transitively
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -195,6 +196,11 @@ public:
 template<typename T, size_t Size>
 class SPSCSharedRingBuffer {
     static_assert((Size & (Size - 1)) == 0, "Size must be power of 2");
+    // T must be trivially copyable: shared-memory rings copy raw bytes across
+    // process boundaries; virtual dispatch pointers or heap pointers in T are
+    // process-local virtual addresses and will silently corrupt the reader.
+    static_assert(std::is_trivially_copyable<T>::value,
+                  "T must be trivially copyable for shared-memory ring buffers");
 
 private:
     struct SharedData {
@@ -269,8 +275,10 @@ public:
 
     size_t size() const {
         const uint64_t write = data_->write_pos.load(std::memory_order_acquire);
-        const uint64_t read = data_->read_pos.load(std::memory_order_acquire);
-        return (write - read) & MASK;
+        const uint64_t read  = data_->read_pos.load(std::memory_order_acquire);
+        // write - read uses wrapping uint64_t arithmetic: no masking needed.
+        // (write - read) & MASK would be wrong — e.g. 5000 items & 4095 = 904.
+        return static_cast<size_t>(write - read);
     }
 
     bool empty() const {
@@ -291,19 +299,28 @@ private:
 template<typename T, size_t Size>
 class MPSCSharedRingBuffer {
     static_assert((Size & (Size - 1)) == 0, "Size must be power of 2");
+    static_assert(std::is_trivially_copyable<T>::value,
+                  "T must be trivially copyable for shared-memory ring buffers");
 
 private:
+    // Sequence-based slots avoid storing raw pointers in shared memory.
+    // Raw pointers are process-local virtual addresses and are unsafe when
+    // different processes map the same shm region at different addresses.
+    struct Cell {
+        std::atomic<uint64_t> sequence;
+        T data;
+    };
+
     struct SharedData {
         alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> write_pos;
         alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> read_pos;
-        alignas(CACHE_LINE_SIZE) std::atomic<T*> slots[Size];
-        alignas(CACHE_LINE_SIZE) T buffer[Size];
+        alignas(CACHE_LINE_SIZE) Cell buffer[Size];
 
         SharedData() {
             write_pos.store(0, std::memory_order_relaxed);
             read_pos.store(0, std::memory_order_relaxed);
             for (size_t i = 0; i < Size; ++i) {
-                slots[i].store(nullptr, std::memory_order_relaxed);
+                buffer[i].sequence.store(i, std::memory_order_relaxed);
             }
         }
     };
@@ -326,36 +343,28 @@ public:
     }
 
     bool try_push(const T& item) {
-        uint64_t current_write;
-        uint64_t next_write;
+        uint64_t pos = data_->write_pos.load(std::memory_order_relaxed);
 
-        do {
-            current_write = data_->write_pos.load(std::memory_order_acquire);
-            next_write = current_write + 1;
+        while (true) {
+            Cell& cell = data_->buffer[pos & MASK];
+            const uint64_t seq = cell.sequence.load(std::memory_order_acquire);
+            const intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
 
-            const uint64_t read = data_->read_pos.load(std::memory_order_acquire);
-            if ((next_write - read) > Size) {
+            if (diff == 0) {
+                if (data_->write_pos.compare_exchange_weak(
+                        pos, pos + 1,
+                        std::memory_order_relaxed,
+                        std::memory_order_relaxed)) {
+                    cell.data = item;
+                    cell.sequence.store(pos + 1, std::memory_order_release);
+                    return true;
+                }
+            } else if (diff < 0) {
                 return false;  // Full
+            } else {
+                pos = data_->write_pos.load(std::memory_order_relaxed);
             }
-
-        } while (!data_->write_pos.compare_exchange_weak(
-            current_write, next_write,
-            std::memory_order_release,
-            std::memory_order_acquire));
-
-        const uint64_t slot_idx = current_write & MASK;
-        data_->buffer[slot_idx] = item;
-
-        T* expected = nullptr;
-        while (!data_->slots[slot_idx].compare_exchange_weak(
-            expected, &data_->buffer[slot_idx],
-            std::memory_order_release,
-            std::memory_order_relaxed)) {
-            expected = nullptr;
-            CPU_PAUSE();
         }
-
-        return true;
     }
 
     void push_wait(const T& item) {
@@ -365,24 +374,24 @@ public:
     }
 
     bool try_pop(T& item) {
-        const uint64_t current_read = data_->read_pos.load(std::memory_order_relaxed);
+        const uint64_t pos = data_->read_pos.load(std::memory_order_relaxed);
+        Cell& cell = data_->buffer[pos & MASK];
+        const uint64_t seq = cell.sequence.load(std::memory_order_acquire);
+        const intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + 1);
 
-        if (current_read == data_->write_pos.load(std::memory_order_acquire)) {
+        if (diff < 0) {
             return false;  // Empty
         }
 
-        const uint64_t slot_idx = current_read & MASK;
-
-        T* data_ptr;
-        while ((data_ptr = data_->slots[slot_idx].load(std::memory_order_acquire)) == nullptr) {
-            CPU_PAUSE();
+        if (diff == 0) {
+            item = cell.data;
+            cell.sequence.store(pos + Size, std::memory_order_release);
+            data_->read_pos.store(pos + 1, std::memory_order_relaxed);
+            return true;
         }
 
-        item = *data_ptr;
-        data_->slots[slot_idx].store(nullptr, std::memory_order_release);
-        data_->read_pos.store(current_read + 1, std::memory_order_release);
-
-        return true;
+        // Writer raced and published a later generation for this slot.
+        return false;
     }
 
     void pop_wait(T& item) {
@@ -404,6 +413,8 @@ private:
 template<typename T, size_t Size>
 class MPMCSharedRingBuffer {
     static_assert((Size & (Size - 1)) == 0, "Size must be power of 2");
+    static_assert(std::is_trivially_copyable<T>::value,
+                  "T must be trivially copyable for shared-memory ring buffers");
 
 private:
     struct Cell {

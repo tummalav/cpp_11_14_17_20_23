@@ -1152,9 +1152,16 @@ public:
         while (!push(item)) CPU_PAUSE();
     }
 
-    // ── SINGLE CONSUMER (gated) ──────────────────────────────────────────────
+    // ── SINGLE GATING CONSUMER ───────────────────────────────────────────────
     // Reads the next slot if available. Updates gating_ to unblock producers.
-    // For multiple consumers, each manages its own local cursor externally.
+    //
+    // SINGLE-CONSUMER ONLY: gating_ is set to consumer_pos directly.
+    // With multiple consumers each calling pop(), the last writer wins and
+    // gating_ could advance past a slow consumer's position, letting producers
+    // overwrite slots that slow consumer has not yet read.
+    //
+    // For multiple consumers: designate ONE barrier consumer that updates
+    // gating_, OR call advance_gating(min_pos_across_all_consumers) externally.
     FORCE_INLINE HOT_PATH bool pop(uint64_t& consumer_pos, T& out) noexcept {
         const uint64_t next = consumer_pos + 1;
         const uint64_t slot = next & MASK;
@@ -1165,6 +1172,18 @@ public:
         consumer_pos = next;
         gating_.store(next, std::memory_order_release); // unblock producers
         return true;
+    }
+
+    // ── MULTI-CONSUMER GATING HELPER ─────────────────────────────────────────
+    // In a multi-consumer setup each consumer tracks its own cursor externally.
+    // After all consumers have advanced, the caller computes the minimum cursor
+    // across all consumers and calls this once to unblock producers.
+    FORCE_INLINE void advance_gating(uint64_t minimum_consumer_pos) noexcept {
+        // Only advance; never move gating_ backwards (producers rely on monotonic).
+        uint64_t current = gating_.load(std::memory_order_relaxed);
+        while (minimum_consumer_pos > current &&
+               !gating_.compare_exchange_weak(current, minimum_consumer_pos,
+                   std::memory_order_release, std::memory_order_relaxed)) {}
     }
 
     uint64_t published_cursor() const noexcept {
@@ -1212,8 +1231,13 @@ static double g_ns_per_tick = 0.4; // ~2.5 GHz default; calibrated below
 void calibrate_tsc() noexcept {
     const auto t0 = std::chrono::steady_clock::now();
     const uint64_t r0 = rdtsc_now();
-    volatile uint64_t spin = 0;
-    for (volatile int i = 0; i < 10000000; ++i) ++spin;
+    uint64_t spin = 0;
+    for (int i = 0; i < 10000000; ++i) {
+        spin += static_cast<uint64_t>(i);
+        // Keep loop from being fully optimized away during calibration.
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+    }
+    (void)spin;
     const uint64_t r1 = rdtsc_now();
     const auto t1 = std::chrono::steady_clock::now();
     const uint64_t wall_ns = static_cast<uint64_t>(
