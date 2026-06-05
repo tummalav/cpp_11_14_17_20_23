@@ -55,6 +55,7 @@ namespace Hardware {
         pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
     }
 
+
     /*
      * Memory Hierarchy Optimization:
      * - Use NUMA-aware allocation
