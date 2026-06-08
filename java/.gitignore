@@ -1,0 +1,17 @@
+# Java compiled output
+*.class
+*.jar
+target/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.iws
+
+# macOS
+.DS_Store
+._*
+
+# Logs
+*.log
