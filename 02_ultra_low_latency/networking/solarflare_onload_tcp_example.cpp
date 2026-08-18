@@ -10,6 +10,10 @@
  * Run with Onload acceleration:
  *   onload --profile=latency ./solarflare_onload_tcp_example server 0.0.0.0 9101
  *   onload --profile=latency ./solarflare_onload_tcp_example client 127.0.0.1 9101 200000
+ *
+ * Onload note:
+ *  - This keeps normal BSD sockets and lets Onload accelerate them transparently.
+ *  - Best for minimal-change TCP services and control-plane paths.
  */
 
 #include <arpa/inet.h>

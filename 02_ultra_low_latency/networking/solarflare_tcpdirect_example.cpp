@@ -5,6 +5,17 @@
  *  - POSIX fallback client/server (always available)
  *  - TCPDirect client path using real zf/zft calls when available
  *
+ * Conceptually:
+ *  - Onload accelerates normal socket code with minimal rewrite.
+ *  - TCPDirect replaces the TCP socket API with zf/zft user-space calls.
+ *  - Use TCPDirect for hot TCP order-entry paths where you can rewrite I/O.
+ *  - ef_vi is packet/NIC-queue level, not a TCP stack.
+ *
+ * PIO vs CTPIO:
+ *  - PIO copies the whole message into NIC memory before transmit.
+ *  - CTPIO starts transmitting while bytes are still being pushed.
+ *  - CTPIO is faster when timing hits, but PIO is simpler and steadier.
+ *
  * Build (fallback):
  *   g++ -std=c++17 -O2 -pthread solarflare_tcpdirect_example.cpp -o solarflare_tcpdirect_example
  *

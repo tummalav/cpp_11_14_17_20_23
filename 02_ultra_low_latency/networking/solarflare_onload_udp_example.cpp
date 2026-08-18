@@ -12,6 +12,10 @@
  *
  * Run sender:
  *   onload --profile=latency ./solarflare_onload_udp_example send 127.0.0.1 9201 200000 64 0
+ *
+ * Onload note:
+ *  - Same socket API, just accelerated by Onload at runtime.
+ *  - Good fit for UDP multicast or unicast feeds without rewriting I/O.
  */
 
 #include <arpa/inet.h>

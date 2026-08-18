@@ -17,6 +17,11 @@
  *
  * Run sender:
  *   ./solarflare_ef_vi_example send eth0 127.0.0.1 5000 100000 64 0
+ *
+ * ef_vi note:
+ *  - This is packet/NIC-queue programming, not a TCP stack.
+ *  - RX posts DMA buffers, polls events, parses packets in place, and reposts buffers.
+ *  - TX copies into registered memory and pushes a NIC transmit descriptor.
  */
 
 #include <arpa/inet.h>
