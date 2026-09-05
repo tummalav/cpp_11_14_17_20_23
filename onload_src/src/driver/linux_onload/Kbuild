@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0
+# X-SPDX-Copyright-Text: (c) Copyright 2021 Xilinx, Inc.
+
+include $(src)/mmake.mk
+onload-objs  := $(ONLOAD_SRCS:%.c=%.o) $(EFTHRM_SRCS:%.c=../../lib/efthrm/%.o) $($(ARCH)_TARGET_SRCS:%.c=%.o)
+LIBS := $(patsubst %,$(obj)/../../lib/%/lib.a, \
+          transport/ip cplane citools ciul)
+$(obj)/onload.o: $(LIBS)
+ldflags-y := --start-group $(LIBS)

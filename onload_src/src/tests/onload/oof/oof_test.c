@@ -1,0 +1,204 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* X-SPDX-Copyright-Text: (c) Copyright 2017 Xilinx, Inc. */
+
+#include "onload_kernel_compat.h"
+#include <onload/oof_interface.h>
+#include <ci/tools.h>
+#include <onload/oof_hw_filter.h>
+#include <onload/oof_socket.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <arpa/inet.h>
+#include <onload/oof_onload.h>
+
+#include "include/onload/tcp_driver.h"
+#include "../../tap/tap.h"
+#include "stack.h"
+#include "oof_test.h"
+#include "cplane.h"
+#include "utils.h"
+
+int oo_debug_bits = 0x1;
+int scalable_filter_gid = -1;
+
+struct ooft_cplane* cp;
+struct efab_tcp_driver_s efab_tcp_driver;
+struct ooft_task* current;
+
+void vdump(const char* fmt, va_list args)
+{
+  vfprintf(stderr, fmt, args);
+  fprintf(stderr, "\n");
+}
+
+void dump(void* opaque, const char* fmt, ...)
+{
+  va_list args;
+
+  va_start(args, fmt);
+  vdump(fmt, args);
+  va_end(args);
+}
+
+
+struct net* current_ns(void)
+{
+  return current->nsproxy->net_ns;
+}
+
+
+struct ooft_task* context_alloc(struct net* ns)
+{
+  struct ooft_task* task = malloc(sizeof(struct ooft_task));
+  TEST(task);
+
+  task->nsproxy = malloc(sizeof(struct ooft_proxy));
+  TEST(task->nsproxy);
+
+  ooft_namespace_get(ns);
+  task->nsproxy->net_ns = ns;
+
+  return task;
+}
+
+
+void context_free(struct ooft_task* task)
+{
+  ooft_namespace_put(task->nsproxy->net_ns);
+  free(task->nsproxy);
+  free(task);
+}
+
+
+void test_alloc(int max_addrs)
+{
+  cp = ooft_alloc_cplane();
+  TEST(cp);
+
+  struct net* ns = ooft_alloc_namespace(cp);
+  TEST(ns);
+
+  current = context_alloc(ns);
+  TEST(current);
+
+  memset(&efab_tcp_driver, 0, sizeof(efab_tcp_driver));
+  TEST(oo_filter_ns_manager_ctor(&efab_tcp_driver) == 0);
+}
+
+
+void test_cleanup(void)
+{
+  struct net* ns = current_ns();
+
+  oo_filter_ns_manager_dtor(&efab_tcp_driver);
+  context_free(current);
+  ooft_free_namespace(ns);
+  ooft_free_cplane(cp);
+}
+
+
+int main(int argc, char* argv[])
+{
+  int all = (argc == 1);
+
+  if( all || !strcmp(argv[1], "sanity") )
+    test_sanity();
+
+  if( all || !strcmp(argv[1], "sanity_no5tuple") )
+    test_sanity_no5tuple();
+
+  if( all || !strcmp(argv[1], "multicast_sanity") )
+    test_multicast_sanity();
+
+  if( all || !strcmp(argv[1], "replication_sanity") )
+    test_replication_sanity();
+
+  if( all || !strcmp(argv[1], "multipath_replication") )
+    test_multipath_replication();
+
+  if( all || !strcmp(argv[1], "multicast_local_addr") )
+    test_multicast_local_addr();
+
+  if( all || !strcmp(argv[1], "namespace_sanity") )
+    test_namespace_sanity();
+
+  if( all || !strcmp(argv[1], "namespace_macvlan_move") )
+    test_namespace_macvlan_move();
+
+  if( all || !strcmp(argv[1], "llct_sanity") )
+    test_llct_sanity();
+
+  if( all || !strcmp(argv[1], "llct_sanity_ff") )
+    test_llct_sanity_ff();
+
+  if( all || !strcmp(argv[1], "llct_sanity_ll") )
+    test_llct_sanity_ll();
+
+  if( all || !strcmp(argv[1], "hidden_socket") )
+    test_hidden_socket();
+
+  if( all || !strcmp(argv[1], "del_sw") )
+    test_del_sw();
+
+  if( all || !strcmp(argv[1], "addr_lifecycle") )
+    test_addr_lifecycle();
+
+  if( all || !strcmp(argv[1], "filter_redirect") )
+    test_filter_redirect();
+
+  if( all || !strcmp(argv[1], "mcast_input_validation") )
+    test_mcast_input_validation();
+
+  if( all || !strcmp(argv[1], "cluster_compat") )
+    test_cluster_compat();
+
+  if( all || !strcmp(argv[1], "threshold_sharing") )
+    test_threshold_sharing();
+
+  if( all || !strcmp(argv[1], "mcast_hw_errors") )
+    test_mcast_hw_errors();
+
+  if( all || !strcmp(argv[1], "mcast_del") )
+    test_mcast_del();
+
+  if( all || !strcmp(argv[1], "mcast_del_sw") )
+    test_mcast_del_sw();
+
+  if( all || !strcmp(argv[1], "mcast_interface_update") )
+    test_mcast_interface_update();
+
+  if( all || !strcmp(argv[1], "hwport_lifecycle") )
+    test_hwport_lifecycle();
+
+  if( all || !strcmp(argv[1], "addr_reactivate") )
+    test_addr_reactivate();
+
+  if( all || !strcmp(argv[1], "mcast_install") )
+    test_mcast_install();
+
+  if( all || !strcmp(argv[1], "udp_connect") )
+    test_udp_connect();
+
+  if( all || !strcmp(argv[1], "mcast_connected") )
+    test_mcast_connected();
+
+  if( all || !strcmp(argv[1], "socket_replace") )
+    test_socket_replace();
+
+  if( all || !strcmp(argv[1], "tproxy_global") )
+    test_tproxy_global();
+
+  if( all || !strcmp(argv[1], "tproxy_global_refcount") )
+    test_tproxy_global_refcount();
+
+  if( all || !strcmp(argv[1], "tproxy_sanity") )
+    test_tproxy_sanity();
+
+  if( all || !strcmp(argv[1], "nat_table") )
+    test_nat_table();
+
+  if( all || !strcmp(argv[1], "nat_socket") )
+    test_nat_socket();
+
+  return 0;
+}

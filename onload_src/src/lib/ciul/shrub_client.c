@@ -1,0 +1,227 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* X-SPDX-Copyright-Text: (c) Copyright 2023 Advanced Micro Devices, Inc. */
+
+#include "ef_vi_internal.h"
+#include <etherfabric/internal/shrub_client.h>
+#include <etherfabric/internal/shrub_socket.h>
+
+/* Accessors for mapped memory */
+static const ef_shrub_buffer_id*
+get_server_fifo(const struct ef_shrub_client* client)
+{
+  return (void*)client->mappings[EF_SHRUB_MAP_SERVER_FIFO];
+}
+
+static ef_shrub_buffer_id*
+get_client_fifo(struct ef_shrub_client* client)
+{
+  return (void*)client->mappings[EF_SHRUB_MAP_CLIENT_FIFO];
+}
+
+static struct ef_shrub_client_state* get_state(struct ef_shrub_client* client)
+{
+  return (void*)(client->mappings[EF_SHRUB_MAP_STATE]);
+}
+
+static size_t map_size(const struct ef_shrub_shared_metrics* metrics, int type)
+{
+  switch( type ) {
+  case EF_SHRUB_FD_BUFFERS:
+    return metrics->buffer_bytes * metrics->buffer_count;
+  case EF_SHRUB_FD_SERVER_FIFO:
+    return metrics->server_fifo_size * sizeof(ef_shrub_buffer_id);
+  case EF_SHRUB_FD_CLIENT_FIFO:
+    return metrics->client_fifo_size * sizeof(ef_shrub_buffer_id) +
+           sizeof(struct ef_shrub_client_state);
+  default:
+    return 0;
+  }
+}
+
+static size_t map_offset(const struct ef_shrub_shared_metrics* metrics,
+                         int fd_type)
+{
+  switch( fd_type ) {
+  case EF_SHRUB_FD_CLIENT_FIFO:
+    return metrics->client_fifo_offset;
+  case EF_SHRUB_FD_SERVER_FIFO:
+    return metrics->server_fifo_offset;
+  default:
+    return 0;
+  }
+}
+
+static int client_mmap(uint64_t* mappings,
+                       const struct ef_shrub_shared_metrics* metrics,
+                       void* buffers)
+{
+  int i;
+  for( i = 0; i < EF_SHRUB_FD_COUNT; ++i ) {
+    int rc;
+    void* addr = i == EF_SHRUB_FD_BUFFERS ? buffers : NULL;
+
+    rc = ef_shrub_socket_mmap(&mappings[EF_SHRUB_FD_COUNT + i], addr,
+                              map_size(metrics, i), mappings[i],
+                              map_offset(metrics, i), i);
+    if( rc < 0 )
+      return rc;
+  }
+
+  mappings[EF_SHRUB_MAP_STATE] =
+    mappings[EF_SHRUB_MAP_CLIENT_FIFO] +
+      map_size(metrics, EF_SHRUB_FD_CLIENT_FIFO) -
+        sizeof(struct ef_shrub_client_state);
+
+  return 0;
+}
+
+void client_munmap(uint64_t* mappings,
+                   const struct ef_shrub_shared_metrics* metrics)
+{
+  int i;
+  for( i = 0; i < EF_SHRUB_FD_COUNT; ++i ) {
+    int m = EF_SHRUB_FD_COUNT + i;
+    if( mappings[m] != 0 ) {
+      ef_shrub_socket_munmap(mappings[m], map_size(metrics, i), i);
+      ef_shrub_socket_close_file(mappings[i]);
+    }
+
+    /* Zero out memory so it doesn't get double freed */
+    mappings[m] = 0;
+  }
+}
+
+int ef_shrub_client_request_filter_info(
+                              const char *server_addr,
+                              struct ef_shrub_filter_info_response *response)
+{
+  struct ef_shrub_request request = {};
+  uintptr_t sock;
+  int rc;
+
+  rc = ef_shrub_socket_open(&sock);
+  if( rc < 0 )
+    return rc;
+
+  rc = ef_shrub_socket_connect(sock, server_addr);
+  if( rc < 0 )
+    goto out;
+
+  request.server_version = EF_SHRUB_VERSION;
+  request.type = EF_SHRUB_REQUEST_FILTER_INFO;
+  rc = ef_shrub_socket_send(sock, &request, sizeof(request));
+  if( rc < 0 )
+    goto out;
+
+  rc = ef_shrub_socket_recv(sock, response, sizeof(*response));
+
+out:
+  ef_shrub_socket_close_socket(sock);
+  return rc;
+}
+
+int ef_shrub_client_open(struct ef_shrub_client* client,
+                         void* buffers,
+                         const char* server_addr,
+                         int qid,
+                         size_t max_connection_buffers)
+{
+  int rc;
+  struct ef_shrub_shared_metrics metrics;
+  struct ef_shrub_request request = {};
+  memset(client, 0, sizeof(*client));
+  client->mappings[EF_SHRUB_MAP_SOCKET] = EF_SHRUB_NO_SOCKET;
+
+  rc = ef_shrub_socket_open(&client->socket);
+  if( rc < 0 )
+    return rc;
+
+  rc = ef_shrub_socket_connect(client->socket, server_addr);
+  if( rc < 0 )
+    goto fail_request;
+
+  request.server_version = EF_SHRUB_VERSION;
+  request.type = EF_SHRUB_REQUEST_QUEUE;
+  request.queue.qid = qid;
+  request.queue.max_connection_buffers = max_connection_buffers;
+  rc = ef_shrub_socket_send(client->socket, &request, sizeof(request));
+  if( rc < 0 )
+    goto fail_request;
+
+  rc = ef_shrub_socket_recv_metrics(&metrics, client->mappings, client->socket);
+  if( rc < 0 )
+    goto fail_request;
+
+  rc = client_mmap(client->mappings, &metrics, buffers);
+  if( rc < 0 )
+    goto fail_mmap;
+
+  /* Store the socket in the mappings array so that the kernel can take a
+   * reference on it to keep the shrub controller connection alive when the
+   * owning process exits. */
+  client->mappings[EF_SHRUB_MAP_SOCKET] = client->socket;
+
+  return 0;
+
+fail_mmap:
+  client_munmap(client->mappings, &metrics);
+fail_request:
+  ef_shrub_socket_close_socket(client->socket);
+  return rc;
+}
+
+void ef_shrub_client_close(struct ef_shrub_client* client)
+{
+  client_munmap(client->mappings, &get_state(client)->metrics);
+  ef_shrub_socket_close_socket(client->socket);
+}
+
+void ef_shrub_client_release_fds(struct ef_shrub_client* client)
+{
+  int i;
+  for( i = 0; i < EF_SHRUB_FD_COUNT; ++i ) {
+    ef_shrub_socket_close_file(client->mappings[i]);
+    client->mappings[i] = EF_SHRUB_DUMMY_SOCKET;
+  }
+  ef_shrub_socket_close_socket(client->socket);
+  client->socket = EF_SHRUB_DUMMY_SOCKET;
+  client->mappings[EF_SHRUB_MAP_SOCKET] = EF_SHRUB_DUMMY_SOCKET;
+}
+
+int ef_shrub_client_acquire_buffer(struct ef_shrub_client* client,
+                                   uint32_t* buffer_id,
+                                   bool* sentinel,
+                                   uint32_t* sbseq)
+{
+  struct ef_shrub_client_state* state = get_state(client);
+  int i = state->server_fifo_index;
+  ef_shrub_buffer_id id = get_server_fifo(client)[i];
+  if( id == EF_SHRUB_INVALID_BUFFER )
+    return -EAGAIN;
+
+  state->server_fifo_index =
+    i == state->metrics.server_fifo_size - 1 ? 0 : i + 1;
+
+  *buffer_id = ef_shrub_buffer_index(id);
+  *sentinel = ef_shrub_buffer_sentinel(id);
+  *sbseq = ef_shrub_buffer_sbseq(id);
+  return 0;
+}
+
+void ef_shrub_client_release_buffer(struct ef_shrub_client* client,
+                                    uint32_t buffer_id)
+{
+  struct ef_shrub_client_state* state = get_state(client);
+  int i = state->client_fifo_index;
+
+  get_client_fifo(client)[i] = buffer_id;
+  state->client_fifo_index =
+    i == state->metrics.client_fifo_size - 1 ? 0 : i + 1;
+}
+
+bool ef_shrub_client_buffer_available(const struct ef_shrub_client* client)
+{
+  int i = ef_shrub_client_get_state(client)->server_fifo_index;
+  ef_shrub_buffer_id id = get_server_fifo(client)[i];
+  return id != EF_SHRUB_INVALID_BUFFER;
+}

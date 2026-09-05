@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: (c) Copyright 2023-2024 Advanced Micro Devices, Inc.
+
+# Remove if already exists
+dkms remove -m #TYPE# -v #VERSION# --all > /dev/null 2>&1 || true
+
+# Build and install
+dkms add -m #TYPE# -v #VERSION#
+dkms build -m #TYPE# -v #VERSION#
+dkms install -m #TYPE# -v #VERSION# --force

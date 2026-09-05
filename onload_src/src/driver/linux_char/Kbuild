@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0
+# X-SPDX-Copyright-Text: (c) Copyright 2021 Xilinx, Inc.
+
+include $(src)/mmake.mk
+
+sfc_char-objs := $(CHAR_TARGET_SRCS:%.c=%.o)
+LIBS := $(patsubst %,$(obj)/../../lib/%/lib.a, \
+          citools ciul)
+$(obj)/sfc_char.o: $(LIBS)
+ldflags-y := --start-group $(LIBS)
