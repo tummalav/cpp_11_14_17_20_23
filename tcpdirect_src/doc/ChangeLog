@@ -1,0 +1,136 @@
+tcpdirect-9.2.0
+---------------
+
+No code changes.
+
+
+tcpdirect-9.1.1.11
+------------------
+
+ON-17116: disable overlapped receive on unsupported EFCT architectures
+
+
+tcpdirect-9.1.0.4
+-----------------
+
+ON-16111: use monitor thread in zfsink to allow testing higher rates
+
+
+tcpdirect-9.0.2.47
+------------------
+
+ON-15400: allow programatically setting log_level, log_format and log_file.
+ON-16143: remove redundant attributes function from zfsink test application
+ON-16265: set no-poison vi flag when ctpio_mode=sf-np
+ON-16273: avoid re-exporting onload symbols in static library
+ON-16327: improve RTT estimation for delegated sends
+ON-16341: force 2MB huge page allocation to run on 1GB default systems
+
+
+tcpdirect-9.0.1.31
+------------------
+
+See corresponding Onload changelog for changes in OS support.
+
+ON-15038: add 'zf_stackdump attr' option to report stack attributes
+ON-15895: ensure Tx timestamps handled correctly for retransmitted packets
+ON-16211: open control plane shared object with versioned name
+
+
+tcpdirect-9.0.0.21
+------------------
+
+See corresponding Onload changelog for changes in OS support.
+
+ON-1440: use new public control plane API
+ON-15038: view zf attributes in zf_stackdump
+ON-15668: add time checking for MAC lookup to better enforce ARP timeout
+ON-15695: ship tcpdirect as source code with refreshed packaging
+ON-15895: handle TX completions for in-flight retransmitted packets
+
+
+tcpdirect-8.1.3.8
+-----------------
+
+See corresponding onload-8.1.3 changelog for changes in OS support.
+
+ON-13593: add udp_ttl attribute to control TTL on sent UDP packets
+ON-15421: stop exporting ef_vi symbols in the dynamic library
+ON-15816: ensure local address is initialized when recycling zft_handle
+
+
+tcpdirect-8.1.2.38
+------------------
+
+See corresponding onload-8.1.2 changelog for changes in OS support.
+
+ON-13158: avoid CTPIO when there won't be space for fallback
+ON-14012: zfsend requires 2 arguments; avoid segfault if only 1
+
+
+tcpdirect-8.1.1.23
+------------------
+
+See corresponding onload-8.1.1 changelog for changes in OS support.
+
+ON-14981: fix insufficient packet buffer allocation observable in some configs
+
+
+tcpdirect-8.1.0.19
+------------------
+
+See corresponding onload-8.1.0 changelog for changes in OS support.
+
+ON-14313: don't force PIO on efct
+ON-14799: add transmit warming for X3522
+
+
+tcpdirect-8.0.2.11
+------------------
+
+ON-14431: X3522: fix discard handling
+
+
+tcpdirect-8.0.1.2
+-----------------
+
+The OS and NIC support list has changed and corresponds to that supported
+by OpenOnload-8.0.1.
+
+ON-14236: restore debian packaging
+ON-14286: include version information in zf_stackdump
+ON-14306: fix segfault in zft_send_single_warm
+
+
+tcpdirect-8.0.0.30
+------------------
+
+Add support for:
+ - Red Hat Enterprise Linux 8.6
+ - Red Hat Enterprise Linux 9.0
+ - Canonical Ubuntu Server LTS 22.04
+ - Canonical Ubuntu Server 21.10
+ - SuSE Linux Enterprise Server 15 SP3
+ - gcc 11.2
+
+Remove support for:
+ - Red Hat Enterprise Linux 6
+ - Canonical Ubuntu Server LTS 18.04
+ - SuSE Linux Enterprise Server 12
+ - Debian 9 "Stretch"
+
+ON-9207: add zf_stack_query_feature() to query PIO and CTPIO support
+ON-9301: add zfsink -p option to print ZF attributes after stack creation
+ON-11543: add per-stack and per-zocket retransmit counters in zf_stackdump
+ON-12776: tcp tx: prevent doing extra copy after every CTPIO or DMA
+ON-12823: add min/max/median/%-ile stats to zftcppingpong/zfudppingpong
+ON-13375: allow creation of TX/RX-only stacks with tx/rx_ring_max=0
+ON-13388: add zf_send application
+X3-447: allow for arbitrary iovec array len
+
+
+See onload-7.1.3 change log for changes in prior versions of TCP Direct
+-----------------------------------------------------------------------
+
+SPDX-License-Identifier: MIT
+SPDX-FileCopyrightText: (c) 2022-2026 Advanced Micro Devices, Inc.

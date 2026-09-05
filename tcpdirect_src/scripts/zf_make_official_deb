@@ -1,0 +1,108 @@
+#! /bin/bash -eu
+#
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: (c) 2022 Advanced Micro Devices, Inc.
+
+bin=$(cd "$(dirname "$0")" && /bin/pwd)
+me=$(basename "$0")
+
+err()  { echo >&2 "$*"; }
+log()  { err "$me: $*"; }
+fail() { rm -rf "$tempfile"; log "$*"; exit 1; }
+try()  { "$@" || fail "FAILED: $*"; }
+
+lib64_path() {
+  if [ -e /lib/x86_64-linux-gnu/libc.so.6 ]; then
+      echo "lib/x86_64-linux-gnu"
+  else
+      echo "lib64"
+  fi
+}
+
+usage() {
+  err
+  err "usage:"
+  err "  $me [options] <zf_tarball>"
+  err
+  err "options:"
+  err "  --out <path>        - directory to write source package to"
+  err "  --version <version> - version number for debian package"
+  err
+  exit 1
+}
+
+######################################################################
+# main
+
+PATH="$bin:$PATH:/usr/sbin:/sbin"; export PATH
+TOP=$(cd "$bin/.." && /bin/pwd)
+outdir=$(pwd)
+version=
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+  --out)            shift; outdir=$1;;
+  --version)        shift; version=$1;;
+  -*)               usage;;
+  *)                break;;
+  esac
+  shift
+done
+
+[ $# -eq 1 ] || usage
+
+tarball=$1
+
+if [ ! -d "$outdir" ]; then
+  echo "$outdir does not appear to be a directory";
+  exit;
+fi
+
+if [ -z "$version" ]; then
+  version="0$(git rev-parse HEAD | cut -c -7)"
+fi
+
+# soversion=$(awk '/^ONLOAD_EXT_VERSION_MAJOR/{print $3}' $TOP/../mk/site/libs.mk)
+package_name="tcpdirect"
+package="${package_name}_${version}"
+tcpdirect_dir="${package_name}-${version}"
+tempfile=$(mktemp -d)
+
+if [ ! -d "$tempfile" ]; then
+  echo "mktemp failed to create a temporary directory - exiting";
+  exit;
+fi
+
+echo "Creating package $package in $tempfile"
+
+try cp "${tarball}" "${tempfile}/${package}.orig.tar.gz"
+try mkdir -p "$tempfile/$tcpdirect_dir/debian"
+
+# Make any necessary replacements in the control files
+find "$TOP"/scripts/debian-templ/* -type f | while read -r i; do
+  debfile="${tempfile}/${tcpdirect_dir}/debian/$(basename "$i")"
+  try sed -e "s/#VERSION#/$version/g" -e "s|#LIBDIR#|$(lib64_path)|g" < "$i" > "$debfile";
+done
+
+# Accoding to the Debian Policy Manual, executable maintainer scripts should be
+# owned by root:root and have mode 755
+for i in postinst postrm; do
+  try chmod 0755 "${tempfile}/${tcpdirect_dir}/debian/$i"
+done
+
+try cd "$tempfile"
+try tar xf "$package.orig.tar.gz" -C "$tcpdirect_dir" --strip-components=1
+try cd "$tcpdirect_dir/debian"
+try debuild -S -i -uc -us -d
+try cd "$tempfile"
+
+echo "Using package components:"
+ls -- *.[gx]z *.dsc
+
+try tar zcf "$package-debiansource.tgz" --owner=root --group=root -- *.[gx]z *.dsc
+try mv "$package-debiansource.tgz" "$outdir/"
+try rm -rf "$tempfile"
+
+echo ""
+echo "Wrote $outdir/$package-debiansource.tgz"
+echo ""
