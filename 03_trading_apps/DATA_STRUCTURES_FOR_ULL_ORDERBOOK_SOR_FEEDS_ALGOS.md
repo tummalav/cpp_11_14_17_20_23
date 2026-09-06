@@ -38,7 +38,8 @@ the four subsystems.
 5. [Algo / Strategy Data Structures](#algo--strategy-data-structures)
 6. [Library Cheat Sheet: In-house vs Abseil vs Folly vs moodycamel](#library-cheat-sheet-in-house-vs-abseil-vs-folly-vs-moodycamel)
 7. [Decision Matrix](#decision-matrix)
-8. [References in This Repo](#references-in-this-repo)
+8. [Reference Implementations (Buildable & Benchmarked)](#reference-implementations-buildable--benchmarked)
+9. [References in This Repo](#references-in-this-repo)
 
 ---
 
@@ -277,10 +278,67 @@ orders, and must react within microseconds to any venue's top-of-book change.
 
 ---
 
+## Reference Implementations (Buildable & Benchmarked)
+
+Every recommendation above has a working, compiled, and benchmarked C++
+implementation in this repo so the trade-offs can be measured directly rather
+than taken on faith. All were built and smoke-tested with Abseil
+`20260817.0` and Folly `2026.07.27.00_1` (via Homebrew) plus vendored
+moodycamel headers.
+
+| Subsystem | File | Approach | Sample benchmark result (this machine) |
+|---|---|---|---|
+| Order book | `orderbook/ull_orderbook.cpp` | In-house array ladder + intrusive FIFO + pool | ~50-200ns per op (see file header) |
+| Order book | `orderbook/orderbook_abseil_variant.cpp` | `absl::flat_hash_map` order index + `absl::btree_map` sparse ladder | insert ~360ns, lookup ~15-24ns |
+| Order book | `orderbook/orderbook_folly_variant.cpp` | `folly::F14FastMap` order index + `folly::sorted_vector_map` snapshot ladder | lookup ~20-22ns |
+| SOR | `sor/sor_inhouse.cpp` | Fixed array venue table + optional binary heap for large N | update+best-venue ~120ns |
+| SOR | `sor/sor_abseil_variant.cpp` | `absl::flat_hash_map` child-order tracking + `absl::btree_map` routing table | insert ~125ns, erase ~40-70ns |
+| SOR | `sor/sor_folly_variant.cpp` | `folly::sorted_vector_map` routing table (read-mostly) | read ~5-7ns |
+| SOR | `sor/sor_moodycamel_queue.cpp` | `moodycamel::ConcurrentQueue` (MPMC) vs `moodycamel::ReaderWriterQueue` (SPSC-per-venue) | MPMC ~110-130ns/decision, SPSC-per-venue ~32ns/decision (~3-4x faster) |
+| Feed handler | `feed_handlers/feed_handler_moodycamel_queue.cpp` | `moodycamel::ConcurrentQueue` (MPSC, shared decode pool) vs `moodycamel::ReaderWriterQueue` (SPSC, dedicated decode thread) | MPSC ~125-130ns/packet, SPSC ~10-11ns/packet (~10x faster) |
+| Feed handler | `feed_handlers/feed_handler_abseil_symbol_table.cpp` | Dense array (hot path) + `absl::flat_hash_map` string→id resolver (session start only) | dense update ~32-33ns, one-time resolve ~56ns |
+| Algo | `execution_algos/algo_child_order_tracker_abseil.cpp` | `absl::flat_hash_map` child-order state machine | insert+ack ~125-2770ns (cache-dependent), fill update ~35-63ns |
+| Algo | `execution_algos/algo_rolling_window_folly.cpp` | `folly::small_vector` fill history (inline for ≤4 fills) + `folly::sorted_vector_map` VWAP bucket curve | ~140-200ns/fill, ~10% orders spill to heap under simulated thin-liquidity load |
+
+**Build everything:**
+```bash
+./build_scripts/build_data_structures_variants.sh
+```
+This script auto-detects a modern compiler (Homebrew LLVM `clang++` is used
+automatically if present, since Abseil/Folly's current headers require
+C++17/20 features older Apple Clang / GCC toolchains reject) and produces all
+binaries under `build/data_structures_variants/`. Each binary is a
+self-contained smoke test + micro-benchmark that prints timing results on run.
+
+**Dependencies:**
+- `brew install abseil folly` (macOS) — provides `absl::flat_hash_map`,
+  `absl::btree_map`, `folly::F14FastMap`, `folly::sorted_vector_map`,
+  `folly::small_vector`.
+- moodycamel `concurrentqueue`/`readerwriterqueue` are vendored as
+  single-header libraries under `third_party/moodycamel/` — no install step
+  needed.
+
+---
+
 ## References in This Repo
 
 - `03_trading_apps/orderbook/ull_orderbook.cpp` — in-house array price-ladder,
   intrusive FIFO, `OrderPool`, SPSC ingress queue, cache-line-aligned `Order`.
+- `03_trading_apps/orderbook/orderbook_abseil_variant.cpp`,
+  `orderbook_folly_variant.cpp` — buildable Abseil/Folly order-book variants
+  (see Reference Implementations above).
+- `03_trading_apps/sor/sor_inhouse.cpp`, `sor_abseil_variant.cpp`,
+  `sor_folly_variant.cpp`, `sor_moodycamel_queue.cpp` — buildable SOR venue
+  aggregator, child-order tracker, routing table, and routing-decision queue
+  variants.
+- `03_trading_apps/feed_handlers/feed_handler_moodycamel_queue.cpp`,
+  `feed_handler_abseil_symbol_table.cpp` — buildable feed-handler NIC-ingress
+  queue and symbol-table variants.
+- `03_trading_apps/execution_algos/algo_child_order_tracker_abseil.cpp`,
+  `algo_rolling_window_folly.cpp` — buildable algo child-order tracking and
+  rolling-window/VWAP-bucket variants.
+- `build_scripts/build_data_structures_variants.sh` — builds and links all of
+  the above against Abseil/Folly/moodycamel in one command.
 - `03_trading_apps/orderbook/itch_top10_aggregated_book.hpp` — feed-handler-side
   book reconstruction (top-10 aggregated depth) example.
 - `03_trading_apps/feed_handlers/ull_feed_handler_infrastructure.hpp`,
