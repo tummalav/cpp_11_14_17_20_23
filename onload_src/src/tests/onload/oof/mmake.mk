@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: GPL-2.0
+# X-SPDX-Copyright-Text: (c) Copyright 2017-2020 Xilinx, Inc.
+SUBDIRS := tests
+
+TARGETS := oof_test
+
+MMAKE_LIBS += $(LINK_CITOOLS_LIB) $(LINK_KCOMPAT_LIB)
+MMAKE_LIB_DEPS += $(CITOOLS_LIB_DEPEND) $(KCOMPAT_LIB_DEPENDS)
+
+SRCS := ../../tap/tap.c oof_test.c oof_interface.c \
+	oof_filters.c tcp_filters.c efrm_interface.c stack_interface.c \
+	stack.c cplane.c efrm.c oof_onload.c oof_nat.c
+TEST_SRCS := tests/sanity.c tests/multicast_sanity.c tests/namespace_sanity.c \
+	tests/namespace_macvlan_move.c tests/sanity_no5tuple.c \
+        tests/llct_sanity.c tests/llct_sanity_ff.c tests/llct_sanity_ll.c \
+	tests/replication_sanity.c tests/multipath_replication.c \
+	tests/multicast_local_addr.c tests/hidden_socket.c tests/del_sw.c \
+	tests/addr_lifecycle.c tests/filter_redirect.c \
+	tests/mcast_input_validation.c tests/cluster_compat.c \
+	tests/threshold_sharing.c tests/mcast_hw_errors.c \
+	tests/mcast_del.c tests/mcast_del_sw.c \
+	tests/mcast_interface_update.c tests/hwport_lifecycle.c \
+	tests/addr_reactivate.c tests/mcast_install.c \
+	tests/udp_connect.c tests/mcast_connected.c \
+	tests/socket_replace.c tests/tproxy_global.c \
+	tests/tproxy_sanity.c tests/nat_table.c
+HDRS := cplane.h oof_impl.h stack_interface.h driverlink_interface.h  \
+	oof_test.h tcp_filters_deps.h efrm_interface.h oo_hw_filter.h \
+	tcp_filters_internal.h onload_kernel_compat.h stack.h utils.h \
+	efrm.h oof_tproxy_ipproto.h oof_onload_types.h oof_filters_deps.h
+
+OBJS := $(patsubst %,%.o,$(SRCS))
+OBJS += $(patsubst %,%.o,$(TEST_SRCS))
+
+# Keep tproxy_sanity available for manual execution while ON-17563 is open.
+DEFAULT_TEST_SRCS := $(filter-out tests/tproxy_sanity.c,$(TEST_SRCS))
+TESTS := $(patsubst tests/%.c,"./oof_test %",$(DEFAULT_TEST_SRCS))
+TESTS += "./oof_test tproxy_global_refcount"
+TESTS += "./oof_test nat_socket"
+# Add the local include directory before the standard include path to allow
+# us to replace system includes where needed.
+MMAKE_INCLUDE := -I$(TOPPATH)/$(CURRENT)/include $(MMAKE_INCLUDE)
+
+%.c.o: %.c $(HDRS)
+	$(MMakeCompileC)
+
+$(TARGETS): $(OBJS) $(MMAKE_LIB_DEPS)
+	@(libs="$(MMAKE_LIBS)"; $(MMakeLinkCApp))
+
+all: $(TARGETS)
+
+targets:
+	@echo $(TARGETS)
+
+clean:
+	@$(MakeClean)
+
+ifdef UNIT_TEST_OUTPUT
+PROVE_FLAGS += --merge --timer
+UNIT_TEST_OUTPUT_DIR = $(UNIT_TEST_OUTPUT)
+PROVE_REDIRECT = >> $(UNIT_TEST_OUTPUT)
+
+tests: $(UNIT_TEST_OUTPUT_DIR)
+
+$(UNIT_TEST_OUTPUT_DIR):
+	mkdir -p $$(dirname $(UNIT_TEST_OUTPUT_DIR))
+	touch $(UNIT_TEST_OUTPUT_DIR)
+endif # UNIT_TEST_OUTPUT
+
+HARNESS_TIME_OUT=240
+
+.PHONY: tests
+tests:
+	/usr/bin/timeout $(HARNESS_TIME_OUT) prove --exec ' ' \
+	$(PROVE_FLAGS) $(TESTS) $(PROVE_REDIRECT)

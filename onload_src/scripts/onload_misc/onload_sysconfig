@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# X-SPDX-Copyright-Text: (c) Copyright 2010-2020 Xilinx, Inc.
+
+############################################################################
+#
+# Settings for the OpenOnload drivers.
+#
+# OpenOnload is a middleware that accelerates network performance.  See
+# http://www.openonload.org/ for details.
+#
+############################################################################
+
+# OpenOnload permissions.
+#
+# The following settings control the permissions applied to /dev/onload.
+# This controls which users can make use of OpenOnload acceleration.
+
+ONLOAD_USER=root
+ONLOAD_GROUP=onload_users
+ONLOAD_MODE=666
+
+
+# ef_vi permissions.
+#
+# The following settings control the permissions applied to /dev/sfc_char.
+# This controls which users can make use of the ef_vi interface.
+
+SFC_CHAR_USER=root
+SFC_CHAR_GROUP=onload_users
+SFC_CHAR_MODE=666
+
+
+# onload_cp_server user.
+#
+# The Onload Control Plane user is configured in `/etc/modprobe.d/onload.conf`
+# as a variable corresponding to the following setting. The user must exist,
+# and does not need any privileges. If this setting is not defined, or the user
+# does not exist when the server starts, the server will run as root.
+#
+# As part of the full install process, a default user 'onload_cplane' is
+# created, typically by sysusers.d/onload.conf.
+#
+# To change, either modify the following to an existing user or create with:
+#   onload_tool set_cplane_user onload_cplane
+
+ONLOAD_CPLANE_USER=onload_cplane
+

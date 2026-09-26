@@ -1,0 +1,134 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# X-SPDX-Copyright-Text: (c) Copyright 2017-2026 Advanced Micro Devices, Inc.
+
+# This file is included by scripts that need to prepare Onload source files
+# for distribution to customers.
+
+year=$(date '+%Y')
+# Copyright banner for version.h
+banner="Copyright (c) 2002-$year Advanced Micro Devices, Inc."
+git=${GIT_PATH:-"git"}
+
+validate_name_ver() {
+  echo "$2" | LC_ALL=C grep -Eq '^[[:alnum:]_.~+-]+$' || fail "$1 string did not validate: $2"
+}
+
+validate_title() {
+  echo "$2" | grep -Eq '^[[:alnum:]_.~+ -]+$' || fail "$1 string did not validate: $2"
+}
+
+copy_distfiles() {
+  # Grab top-level files.
+
+  local distfiles_d="$1"
+
+  try cp -a "$distfiles_d"/{README,*LICENSE*,ChangeLog} .
+  try cp -a "$distfiles_d"/README.ef_vi .
+  [ -f "$distfiles_d"/ReleaseNotes ] &&
+    try cp -a "$distfiles_d"/ReleaseNotes .
+  [ -f "$distfiles_d"/ReleaseNotes-sfc ] &&
+    try cp -a "$distfiles_d"/ReleaseNotes-sfc .
+}
+
+
+update_readme_strings() {
+  local product="$1"
+  local version="$2"
+  local src_rev="$3"
+
+  try [ -n "$src_rev" ]
+  echo "$version" | grep -q "," && fail "ERROR: Version contains a comma"
+
+  # Do not mention the release profile if it is the default
+
+  # Perform substitions in README file template
+  try sed -i -e "s,ONLOAD_VERSION,$product-$version," \
+             -e "s,ONLOAD_TAG,$src_rev," \
+             -e "s,PACKAGE_DATE,$(date)," README
+}
+
+
+update_product_strings() {
+  # Update some files with version information.
+
+  local Product="$1"
+  local product="$2"
+  local version="$3"
+
+  (
+    echo "echo \"#ifndef ONLOAD_BUILD_PROFILE\""
+    echo "echo \"#define ONLOAD_BUILD_PROFILE \\\"\\\"\""
+    echo "echo \"#endif\""
+    echo "echo \"#define ONLOAD_VERSION  \\\"$version \\\"ONLOAD_BUILD_PROFILE\""
+    echo "echo \"#define ONLOAD_SHORT_VERSION ONLOAD_VERSION\""
+    echo "echo \"#define ONLOAD_PRODUCT \\\"$Product\\\"\""
+    echo "echo \"#define ONLOAD_COPYRIGHT \\\"$banner\\\"\""
+  ) > scripts/onload_version_gen
+  try sed -i \
+    "/define pkgversion/ c%define pkgversion $version" \
+    scripts/onload_misc/openonload.spec
+  if [ "$Product" != OpenOnload ]; then
+    try sed -i \
+      -e "/^Summary: */ s/OpenOnload/$Product/" \
+      -e "/^Name: */ s/openonload/$product/" \
+      scripts/onload_misc/openonload.spec
+  fi
+  try sed -i \
+    -e "/^PACKAGE_NAME=/ s/.*/PACKAGE_NAME=$product/" \
+    -e "/^PACKAGE_VERSION=/ s/.*/PACKAGE_VERSION=$version/" \
+    scripts/onload_misc/dkms.conf
+  mv scripts/onload_misc/dkms.conf dkms.conf
+}
+
+instantiate_debian_template() {
+  local product="$1"
+  local version="$2"
+  local soversion=$(awk '/^ONLOAD_EXT_VERSION_MAJOR/{print $3}' mk/site/libs.mk)
+
+  validate_name_ver soversion "$soversion"
+
+  try mv scripts/debian/debian-templ debian
+  try find debian -type f ! -path 'debian/source/*' -exec \
+    sed -i -e "s/#VERSION#/$version/g" \
+           -e "s/#TYPE#/$product/g" \
+           -e "s/#SOVERSION#/${soversion}/g" '{}' +
+
+  for f in debian/type-*; do
+    try mv "$f" "debian/$product-${f#debian/type-}"
+  done
+}
+
+# This is a wrapper around the various preprocessing stages for environments
+# with appropriately-defined global variables.
+preprocess_source() {
+  [ -n "$src_rev" ] || src_rev=$(cd "$TOP" && "$git" rev-parse --short=7 HEAD)
+
+  validate_name_ver product "$product"
+  validate_name_ver version "$version"
+  validate_name_ver src_rev "$src_rev"
+  validate_title Product "$Product"
+
+  copy_distfiles "$distfiles_d"
+  update_readme_strings "$product" "$version" "$src_rev"
+  update_product_strings "$Product" "$product" "$version"
+  instantiate_debian_template "$product" "$version"
+}
+
+
+inittmp() {
+  preprocess_tmp=
+  trap 'rm -rf "$preprocess_tmp"' EXIT
+}
+
+settmp() {
+  try [ -z "$preprocess_tmp" ]
+  preprocess_tmp="$1";
+  try [ -n "$preprocess_tmp" ]
+}
+
+rmtmp() {
+  [ -n "$preprocess_tmp" ] && rm -rf "$preprocess_tmp"
+  preprocess_tmp=
+}
+
+inittmp

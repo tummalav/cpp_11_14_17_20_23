@@ -1,0 +1,209 @@
+#! /bin/bash -e
+#
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: (c) 2020-2024 Advanced Micro Devices, Inc.
+#
+##############################################################################
+# Builds a TCPDirect package for use by customers, containing prebuilt
+# libraries and binaries in both debug and release forms, and scripts
+# to install and uninstall the package
+##############################################################################
+
+
+##
+# Setup build directory
+
+my_dir=$(cd "$(dirname "$0")" && /bin/pwd)
+top_dir=$(dirname "${my_dir}")
+
+copy_to_tmpdir=(
+"versions.env"
+"Makefile"
+"Makefile.onload"
+"Makefile-top.inc"
+"src"
+"scripts"
+)
+
+usage() {
+    echo
+    echo "usage:"
+    echo "  $(basename "$0") [options] [onload_tarball]"
+    echo
+    echo "(Installed onload & onload-devel utilised when onload_tarball omitted.)"
+    echo
+    echo "options:"
+    echo "  --version <version>"
+    echo "  --shim"
+    echo "  --name <tarball_prefix>"
+    echo
+    exit 1
+}
+
+
+cleanup() {
+    echo "Deleting ${tmpdir}"
+    rm -rf "${tmpdir}"
+}
+
+
+copy_files_to_tmpdir() {
+    mkdir -p "${zf_tmpdir}"
+    tar cz -C "${top_dir}" "${copy_to_tmpdir[@]}" | tar xz -C "${zf_tmpdir}"
+    if [ -n "$onload_tarball" ]; then
+      mkdir -p "${onload_tmpdir}";
+      tar xzf "${onload_tarball}" -C "${onload_tmpdir}";
+    fi
+}
+
+
+grab_artifacts_from_tmpdir() {
+    artifact_tmpdir="${zf_tmpdir}/build/artifacts"
+    local_dir="${top_dir}/build/artifacts"
+    mkdir -p "${local_dir}"
+    tar cz -C "${artifact_tmpdir}" . | tar zx -C "${local_dir}"
+}
+
+make_release_package() {
+    package_version="$1"
+    "${top_dir}"/scripts/zf_make_tarball --version "${package_version}" --name "${name}"
+}
+
+
+##
+# Build
+
+
+locate_compiler() {
+    compiler=$(readlink -f /opt/zf/cc || echo)
+    if [ ! -e "${ZF_CC}" ]; then
+        compiler="/opt/rh/devtoolset-7/root/usr/bin/cc"
+    fi
+    echo "${compiler}"
+}
+
+
+build_and_copy_artifacts() {
+    build_type="$1"
+    artifact_dir="$2"
+    if [ "${build_type}" == "debug" ]; then
+        echo "Building debug binaries"
+        make_args=
+    elif [ "${build_type}" == "shim" ]; then
+        echo "Building socket shim"
+        make_args="ZF_DEVEL=1 shim"
+    else
+        echo "Building ndebug binaries"
+        make_args=NDEBUG=1
+    fi
+
+    build_dir="${zf_tmpdir}"/build
+    # Clean the build directory, but ensure we don't delete the artifacts from a
+    # previous build stage.
+    find "${build_dir}" -maxdepth 1 -mindepth 1 -type d |
+      while read -r d; do
+        if [ "$(realpath "${d}")" != "$(realpath "${artifact_dir}")" ]; then
+          rm -rf "${d}";
+        fi
+      done
+    cd "${zf_tmpdir}"
+    # shellcheck disable=SC2086
+    make ${parallel} ${make_args}
+    if [ -n "$onload_tarball" ]; then
+      build_tree=$(ls -d "${build_dir}"/gnu*);
+    else
+      build_tree=$(ls -d "${build_dir}");
+    fi
+    copy_artifacts "${build_tree}" "${artifact_dir}" "${build_type}"
+}
+
+
+copy_artifacts() {
+    build_dir="$1"
+    dest_dir="$2"
+    build_type="$3"
+
+    if [ "${build_type}" == "shim" ]; then
+        mkdir -p "${dest_dir}"/shim
+        cp -a "$build_dir"/lib/libzf_sockets.so "${dest_dir}"/shim
+        return
+    fi
+
+    lib_dir="${dest_dir}/${build_type}/lib"
+    bin_dir="${dest_dir}/${build_type}/bin"
+    mkdir -p "${lib_dir}"
+    mkdir -p "${bin_dir}"
+
+    # Copy binaries
+    cp -a "${build_dir}"/bin/zf_stackdump "${bin_dir}"
+    cp -a "${build_dir}"/lib/libonload_zf_static.a "${lib_dir}"
+    cp -a "${build_dir}"/lib/libonload_zf.so* "${lib_dir}"
+}
+
+
+build_zf() {
+  if [ -z "$CC" ]; then
+      wanted_cc=$(locate_compiler)
+      if [ -f "$wanted_cc" ]; then
+          export CC="$wanted_cc"
+          echo "Set CC=$wanted_cc"
+      else
+          echo "Failed to find compiler, not setting CC=$wanted_cc"
+      fi
+  fi
+
+  if [ -n "$onload_tarball" ]; then
+    ONLOAD_TREE="$(ls -1d "$onload_tmpdir"/*)"
+    export ONLOAD_TREE
+  fi
+  artifact_dir="${zf_tmpdir}/build/artifacts/"
+  rm -rf "${artifact_dir}"
+  build_and_copy_artifacts "debug" "${artifact_dir}"
+  build_and_copy_artifacts "release" "${artifact_dir}"
+  if [ "$shim" = "true" ]; then
+      build_and_copy_artifacts "shim" "${artifact_dir}"
+  fi
+}
+
+
+######################################################################
+# main()
+
+version=
+shim=false
+name="zf"
+parallel=-j$(nproc)
+onload_tarball=
+tarball_count=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --version)  shift; version="$1";;
+        --shim) shim=true;;
+        --name) shift; name="$1";;
+        -*)  usage;;
+        *)  onload_tarball="$1"; tarball_count=$((tarball_count+1));;
+    esac
+    shift
+done
+
+if [ -z "$version" ]; then
+    version=$(git rev-parse HEAD)
+fi
+
+[ $tarball_count -eq 1 ] || [ -d /usr/include/ci ] || usage
+
+if $shim && [ -z "$onload_tarball" ]; then
+  echo "In order to build the socket shim, please supply an onload tarball";
+  usage;
+fi
+
+declare -r tmpdir=$(mktemp -d)
+onload_tmpdir="${tmpdir}/onload"
+zf_tmpdir="${tmpdir}/zf"
+trap cleanup EXIT
+
+copy_files_to_tmpdir
+build_zf
+grab_artifacts_from_tmpdir
+make_release_package "${version}"

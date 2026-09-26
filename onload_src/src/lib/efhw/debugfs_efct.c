@@ -1,0 +1,303 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/* X-SPDX-Copyright-Text: Copyright (C) 2023, Advanced Micro Devices, Inc. */
+
+#include <linux/module.h>
+#include <linux/debugfs.h>
+#include <linux/dcache.h>
+#include <linux/seq_file.h>
+#include <linux/slab.h>
+
+#include <ci/efhw/nic.h>
+#include <ci/efhw/efct.h>
+#include <ci/efhw/ef10ct.h>
+#include <ci/efhw/efct_filters.h>
+#include <lib/efhw/tph.h>
+
+#include "linux_resource_internal.h"
+#include "debugfs.h"
+#include "efct_filters_internal.h"
+
+
+#ifdef CONFIG_DEBUG_FS
+
+
+static int efct_debugfs_read_hw_filters(struct seq_file *file,
+                                        const struct efct_filter_state *fs)
+{
+  struct efct_hw_filter *filter;
+  int i;
+  /* 24 bytes should be enough to store remote ipv4 address and port:
+   * 16 (ip address) + 1 (colon) + 5 (port) + 1 (trailing space) + 1 (null) */
+  char remote_ip_buf[24] = {0};
+
+  for( i = 0; i < fs->hw_filters_n; i++ ) {
+    filter = &fs->hw_filters[i];
+    if( filter->refcount > 0 ) {
+      if( filter->drv_id == EFCT_HW_FILTER_DRV_ID_DUMMY)
+        continue;
+      snprintf(remote_ip_buf, sizeof(remote_ip_buf), "%pI4:%d ",
+               &filter->remote_ip, ntohs(filter->remote_port));
+      seq_printf(file, "%03x: ref: %d\tid: %d/%llu\trxq: %d\t%s:%pI4:%d %s"
+                       "%pM %d\n", i,
+                 filter->refcount, filter->hw_id, filter->drv_id, filter->rxq,
+                 filter->ip_proto == IPPROTO_UDP ? "udp" :
+                 filter->ip_proto == IPPROTO_TCP ? "tcp" : "unknown",
+                 &filter->local_ip, ntohs(filter->local_port), remote_ip_buf,
+                 &filter->loc_mac, filter->outer_vlan < 0 ? -1 :
+                 ntohs(filter->outer_vlan & 0xffff));
+    }
+  }
+  return 0;
+}
+
+static int
+efct_debugfs_read_exclusive_rxq_mapping(struct seq_file *file, int rxq_n,
+                                        const struct efct_filter_state *fs)
+{
+  int qid;
+  seq_printf(file, "exclusive rxq map: ");
+  for( qid = 0; qid < rxq_n; ++qid ) {
+    uint32_t excl = fs->exclusive_rxq_mapping[qid];
+    if( qid % 8 == 0 )
+      seq_printf(file, "\n%3d:", qid);
+    if( excl && excl != EFHW_PD_NON_EXC_TOKEN )
+      seq_printf(file, " %08x", excl);
+    else
+      seq_printf(file, "        -");
+  }
+  seq_printf(file, "\n");
+  return 0;
+}
+
+static int
+efct_debugfs_read_filter_state(struct seq_file *file, int rxq_n,
+                               const struct efct_filter_state *fs)
+{
+  seq_printf(file, "%d\n", fs->hw_filters_n);
+  efct_debugfs_read_hw_filters(file, fs);
+  efct_debugfs_read_exclusive_rxq_mapping(file, rxq_n, fs);
+  return 0;
+}
+
+static int
+efct_debugfs_read_efct_filter_state(struct seq_file *file, const void *data)
+{
+  const struct efhw_nic_efct *efct = data;
+  const struct efct_filter_state *fs = efct->filter_state;
+
+  return efct_debugfs_read_filter_state(file, efct->rxq_n, fs);
+}
+
+static int
+efct_debugfs_read_ef10ct_filter_state(struct seq_file *file, const void *data)
+{
+  const struct efhw_nic_ef10ct *ef10ct = data;
+  const struct efct_filter_state *fs = ef10ct->filter_state;
+
+  return efct_debugfs_read_filter_state(file, ef10ct->rxq_n, fs);
+}
+
+static void
+efct_debugfs_read_wakeup_bits(struct seq_file *file,
+                              const struct efhw_nic_efct_rxq_wakeup_bits *bits)
+{
+  seq_printf(file, "  now: 0x%x\n", bits->now);
+  seq_printf(file, "  awaiters: 0x%x\n", bits->awaiters);
+}
+
+static void
+efct_debugfs_read_efct_rxq_state(struct seq_file *file,
+                                 const struct efhw_nic_efct_rxq *rxq)
+{
+  seq_printf(file, "  added: 0x%x\n", rxq->sbufs.added);
+  seq_printf(file, "  removed: 0x%x\n", rxq->sbufs.removed);
+  seq_printf(file, "  oldest_app_seq: 0x%x\n", rxq->sbufs.oldest_app_seq);
+  efct_debugfs_read_wakeup_bits(file, &rxq->apps);
+}
+
+static void
+efct_debugfs_read_ef10ct_rxq_state(struct seq_file *file,
+                                   const struct efhw_nic_ef10ct_rxq *rxq)
+{
+  seq_printf(file, "  evq_id: 0x%x\n", rxq->evq_id);
+  seq_printf(file, "  ref_count: %d\n", rxq->ref_count);
+  switch( rxq->state ) {
+  case EF10CT_RXQ_STATE_FREE:
+    seq_printf(file, "  state: FREE\n");
+    break;
+  case EF10CT_RXQ_STATE_ALLOCATED:
+    seq_printf(file, "  state: ALLOCATED\n");
+    break;
+  case EF10CT_RXQ_STATE_INITIALISED:
+    seq_printf(file, "  state: INITIALISED\n");
+    break;
+  case EF10CT_RXQ_STATE_FREEING:
+    seq_printf(file, "  state: FREEING\n");
+    break;
+  default:
+    seq_printf(file, "  state: UNKNOWN (%d)\n", rxq->state);
+    break;
+  };
+  if( rxq->n_buffer_pages == 0 ) {
+    /* shrub */
+    efct_debugfs_read_wakeup_bits(file, &rxq->apps);
+    seq_printf(file, "  pktix: 0x%x\n", rxq->pktix);
+  }
+  else {
+    /* non-shrub */
+    seq_printf(file, "  n_buffer_pages: %zd\n", rxq->n_buffer_pages);
+  }
+
+  if ( rxq->steering_tag == EFHW_TPH_STEERING_TAG_UNUSED ) {
+    seq_printf(file, "  steering_tag: Unused\n");
+  }
+  else if ( rxq->steering_tag == EFHW_TPH_STEERING_TAG_TURNED_OFF ) {
+    seq_printf(file, "  steering_tag: TPH steering turned off\n");
+  }
+  else if ( rxq->steering_tag < 0 ) {
+    seq_printf(file, "  steering_tag: Error %d\n", rxq->steering_tag);
+  }
+  else if ( rxq->steering_tag == 0 ) {
+    seq_printf(file, "  steering_tag: No-ST mode\n");  
+  } else {
+    seq_printf(file, "  steering_tag: %d\n", rxq->steering_tag);
+  }
+}
+
+static int
+efct_debugfs_read_ef10ct_rxqs_state(struct seq_file *file, const void *data)
+{
+  const struct efhw_nic_ef10ct *ef10ct = data;
+  int i;
+
+  for( i = 0; i < ef10ct->rxq_n; i++ ) {
+    if( (ef10ct->rxq[i].ref_count > 0) ||
+        (ef10ct->rxq[i].state != EF10CT_RXQ_STATE_FREE) ) {
+      seq_printf(file, "\n---------------------\nrxq: %d\n", i);
+      efct_debugfs_read_ef10ct_rxq_state(file, &ef10ct->rxq[i]);
+    }
+  }
+
+  return 0;
+}
+
+static int
+efct_debugfs_read_ef10ct_shared_evqs_state(struct seq_file *file,
+                                           const void *data)
+{
+  const struct efhw_nic_ef10ct *ef10ct = data;
+  int i;
+
+  for( i = 0; i < ef10ct->shared_n; i++ ) {
+    seq_printf(file, "\n---------------------\nshared_evq: %#x\n",
+                     ef10ct->shared[i].evq_id);
+    seq_printf(file, "  irq: %d\n", ef10ct->shared[i].irq);
+    seq_printf(file, "  name: %s\n", ef10ct->shared[i].name);
+    seq_printf(file, "  overflow: %#x\n", ef10ct->shared[i].overflow);
+    seq_printf(file, "  tx_flush_evs: %#x\n", ef10ct->shared[i].tx_flush_evs);
+    seq_printf(file, "  rx_flush_evs: %#x\n", ef10ct->shared[i].rx_flush_evs);
+    seq_printf(file, "  rx_evs: %#x\n", ef10ct->shared[i].rx_evs);
+  }
+
+  return 0;
+}
+static int
+efct_debugfs_read_efct_rxqs_state(struct seq_file *file, const void *data)
+{
+  const struct efhw_nic_efct *efct = data;
+  int i;
+
+  for( i = 0; i < efct->rxq_n; i++ ) {
+    seq_printf(file, "\n---------------------\nrxq: %d\n", i);
+    efct_debugfs_read_efct_rxq_state(file, &efct->rxq[i]);
+  }
+
+  return 0;
+}
+
+static const struct efrm_debugfs_parameter efhw_debugfs_efct_parameters[] = {
+  EFRM_U32_PARAMETER(struct efhw_nic_efct, rxq_n),
+  EFRM_U32_PARAMETER(struct efhw_nic_efct, evq_n),
+  _EFRM_RAW_PARAMETER(hw_filters, efct_debugfs_read_efct_filter_state),
+  _EFRM_RAW_PARAMETER(rxqs, efct_debugfs_read_efct_rxqs_state),
+  {NULL},
+};
+
+/**
+ * efhw_init_debugfs_efct - create debugfs directory for efct details
+ * @nic: efhw_nic
+ *
+ * Create debugfs directory containing parameter-files for @nic
+ * The directories must be cleaned up using efhw_fini_debugfs_efct().
+ */
+void efhw_init_debugfs_efct(struct efhw_nic *nic)
+{
+  struct efhw_nic_efct *efct = (struct efhw_nic_efct *) nic->arch_extra;
+
+  /* Create directory */
+  efct->debug_dir.dir = debugfs_create_dir("efct", nic->debug_dir.dir);
+
+  /* Create files */
+  efrm_init_debugfs_files(&efct->debug_dir, efhw_debugfs_efct_parameters, efct);
+}
+
+/**
+ * efhw_fini_debugfs_efct - remove debugfs directories for efct
+ * @nic: efhw_nic
+ *
+ * Remove debugfs directories created for @nic by efhw_init_debugfs_efct().
+ */
+void efhw_fini_debugfs_efct(struct efhw_nic *nic)
+{
+  struct efhw_nic_efct *efct = (struct efhw_nic_efct *) nic->arch_extra;
+
+  efrm_fini_debugfs_files(&efct->debug_dir);
+}
+
+static const struct efrm_debugfs_parameter efhw_debugfs_ef10ct_parameters[] = {
+  EFRM_U32_PARAMETER(struct efhw_nic_ef10ct, rxq_n),
+  EFRM_U32_PARAMETER(struct efhw_nic_ef10ct, evq_n),
+  _EFRM_RAW_PARAMETER(hw_filters, efct_debugfs_read_ef10ct_filter_state),
+  _EFRM_RAW_PARAMETER(rxqs, efct_debugfs_read_ef10ct_rxqs_state),
+  _EFRM_RAW_PARAMETER(shared, efct_debugfs_read_ef10ct_shared_evqs_state),
+  {NULL},
+};
+
+/**
+ * efhw_init_debugfs_ef10ct - create debugfs directory for ef10ct details
+ * @nic: efhw_nic
+ *
+ * Create debugfs directory containing parameter-files for @nic
+ * The directories must be cleaned up using efhw_fini_debugfs_ef10ct().
+ */
+void efhw_init_debugfs_ef10ct(struct efhw_nic *nic)
+{
+  struct efhw_nic_ef10ct *ef10ct = (struct efhw_nic_ef10ct *) nic->arch_extra;
+
+  /* Create directory */
+  ef10ct->debug_dir.dir = debugfs_create_dir("ef10ct", nic->debug_dir.dir);
+
+  /* Create files */
+  efrm_init_debugfs_files(&ef10ct->debug_dir, efhw_debugfs_ef10ct_parameters, ef10ct);
+}
+
+/**
+ * efhw_fini_debugfs_ef10ct - remove debugfs directories for ef10ct
+ * @nic: efhw_nic
+ *
+ * Remove debugfs directories created for @nic by efhw_init_debugfs_ef10ct().
+ */
+void efhw_fini_debugfs_ef10ct(struct efhw_nic *nic)
+{
+  struct efhw_nic_ef10ct *ef10ct = (struct efhw_nic_ef10ct *) nic->arch_extra;
+
+  efrm_fini_debugfs_files(&ef10ct->debug_dir);
+}
+
+#else /* !CONFIG_DEBUG_FS */
+void efhw_init_debugfs_efct(struct efhw_nic *nic) {}
+void efhw_fini_debugfs_efct(struct efhw_nic *nic) {}
+
+void efhw_init_debugfs_ef10ct(struct efhw_nic *nic) {}
+void efhw_fini_debugfs_ef10ct(struct efhw_nic *nic) {}
+#endif /* CONFIG_DEBUG_FS */

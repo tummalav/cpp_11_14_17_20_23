@@ -1,0 +1,46 @@
+Source: #TYPE#
+Section: net
+Priority: extra
+Maintainer: AMD NIC Support <support-nic@amd.com>
+Build-Depends: debhelper (>= 8.0.0), bzip2, gawk, libc6, dh-python, python3-all, python3-setuptools, libpcap-dev, libcap-dev, debhelper (>= 13.3), pybuild-plugin-pyproject
+Standards-Version: 3.9.3
+Homepage: http://www.openonload.org
+
+Package: #TYPE#-user
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ${python3:Depends}
+Suggests: #TYPE#-modules (>= ${source:Version}), #TYPE#-dev, #TYPE#-examples
+Provides: onload-user
+Description: Onload TCP/IP stack - library
+Build-Profiles: <!pkg.#TYPE#.nouser>
+
+Package: #TYPE#-source
+Architecture: all
+Depends: module-assistant, debhelper (>= 7), make, bzip2, #TYPE#-user (>= ${source:Version}), #TYPE#-user (<< ${source:Version}.1~), ${misc:Depends}
+Provides: onload-source
+Description: source for the #TYPE# driver.
+ This package provides the source code for the #TYPE# kernel modules.
+ The #TYPE# package is also required in order to make use of these
+ modules. Kernel source or headers are required to compile these modules.
+Build-Profiles: <!pkg.#TYPE#.nosource>
+
+Package: #TYPE#-dkms
+Architecture: all
+Depends: dkms, #TYPE#-user (>= ${source:Version}), #TYPE#-user (<< ${source:Version}.1~), ${misc:Depends}
+Description: Onload debian package with DKMS
+Conflicts: #TYPE#-modules
+Build-Profiles: <!pkg.#TYPE#.nodkms>
+
+Package: #TYPE#-dev
+Architecture: all
+Description: Onload development headers
+Enhances: #TYPE#-user
+Provides: onload-dev
+Build-Profiles: <!pkg.#TYPE#.nodev>
+
+Package: #TYPE#-examples
+Architecture: all
+Description: Onload and EF_VI sample applications
+Enhances: #TYPE#-user
+Provides: onload-examples
+Build-Profiles: <!pkg.#TYPE#.noexamples>

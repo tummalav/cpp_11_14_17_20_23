@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0
+# X-SPDX-Copyright-Text: (c) Copyright 2021 Xilinx, Inc.
+
+override undefine MMAKE_IN_KBUILD
+include $(src)/mmake.mk
+BUILDPATH := $(obj)
+include $(src)/../../../mk/site/cplane.mk
+
+LIB_OBJS  := $(LIB_SRCS:%.c=%.o)
+lib-y     := $(LIB_OBJS)
+ccflags-y := -include $(CP_INTF_VER_HDR) -DMODULE
+
+$(addprefix $(obj)/,$(LIB_OBJS)) : $(CP_INTF_VER_HDR)
+KBUILD_BUILTIN := 1

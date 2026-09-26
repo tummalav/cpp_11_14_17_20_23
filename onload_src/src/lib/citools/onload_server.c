@@ -1,0 +1,149 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* SPDX-FileCopyrightText: Copyright (C) 2025, Advanced Micro Devices, Inc. */
+
+#define _GNU_SOURCE
+
+#include <limits.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+#include <syslog.h>
+#include <unistd.h>
+#include <sys/resource.h>
+
+#include <ci/tools/log.h>
+#include <ci/tools/debug.h>
+#include <ci/tools/onload_server.h>
+
+#define DEV_KMSG "/dev/kmsg"
+
+
+CI_NORETURN ci_server_init_failed_v(const char* srv_name,
+                                    const char* msg, va_list args)
+{
+  ci_vlog(msg, args);
+  ci_log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+  ci_log("!!! %s has FAILED TO START !!!", srv_name);
+  ci_log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+  exit(1);
+}
+
+
+CI_NORETURN ci_server_init_failed(const char* srv_name,
+                                  const char* msg, ...)
+{
+  va_list args;
+  va_start(args, msg);
+  ci_server_init_failed_v(srv_name, msg, args);
+}
+
+
+void ci_server_set_log_prefix(char** log_prefix, const char* srv_bin)
+{
+  int rc = asprintf(log_prefix, "%s[%d]: ", srv_bin, getpid());
+  if( rc < 0 ) {
+    ci_log("Failed to set log prefix %s[%d]", srv_bin, getpid());
+    return;
+  }
+
+  ci_set_log_prefix(*log_prefix);
+}
+
+
+/* Fork off a daemon process according to the recipe in "man 7 daemon".  This
+ * function returns only in the context of the daemon, and only on success;
+ * otherwise, it exits. */
+void ci_server_daemonise(char** log_prefix,
+                         const char* srv_name, const char* srv_bin,
+                         unsigned flags)
+{
+  pid_t child;
+  int rc;
+  int devnull;
+  int i;
+  sigset_t sigset;
+
+  /* Start with some tidy-up.  We don't check errors here as failure is non-
+   * fatal. */
+
+  /* Close all files above stderr. */
+  if( (flags & CI_DAEMON_CLOSE_FDS) )
+    close_range(STDERR_FILENO + 1, ~0U, 0);
+
+  /* Reset all signal handlers. */
+  for( i = 0; i < _NSIG; ++i )
+    signal(i, SIG_DFL);
+
+  /* Unblock all signals. */
+  sigfillset(&sigset);
+  sigprocmask(SIG_UNBLOCK, &sigset, NULL);
+
+  /* Make sure we're not a process group leader so that setsid() will give us a
+   * new session. */
+  child = fork();
+  if( child == -1 )
+    ci_server_init_failed(srv_name, "Failed to fork: %s", strerror(errno));
+  else if( child != 0 )
+    /* Parent process. */
+    exit(0);
+
+  /* Get a new session. */
+  rc = setsid();
+  if( rc == -1 )
+    ci_server_init_failed(srv_name, "setsid() failed: %s", strerror(errno));
+
+  /* Fork to relinquish position as process group leader. */
+  child = fork();
+  if( child == -1 ) {
+    ci_server_init_failed(srv_name, "Failed to fork: %s", strerror(errno));
+  }
+  else if( child != 0 ) {
+    /* Parent process.  The child is the 'real' daemon. */
+    exit(0);
+  }
+  ci_log("Spawned daemon process %d", getpid());
+
+  umask(0);
+  if( flags & CI_DAEMON_CHDIR_ROOT ) {
+    rc = chdir("/");
+    if( rc == -1 )
+      ci_server_init_failed(srv_name, "Failed to change to root directory: %s",
+                            strerror(errno));
+  }
+
+  devnull = open("/dev/null", O_RDONLY);
+  if( devnull == -1 )
+    ci_server_init_failed(srv_name, "Failed to open /dev/null for reading: %s",
+                          strerror(errno));
+  rc = dup2(devnull, STDIN_FILENO);
+  if( rc == -1 )
+    ci_server_init_failed(srv_name, "Failed to dup /dev/null onto stdin: %s",
+                          strerror(errno));
+  close(devnull);
+
+  devnull = open(flags & CI_DAEMON_LOG_TO_KERN ? DEV_KMSG : "/dev/null", O_WRONLY);
+  if( devnull == -1 )
+    ci_server_init_failed(srv_name, "Failed to open /dev/null for writing: %s",
+                          strerror(errno));
+
+  /* Start logging to syslog before we nullify std{out,err}. */
+  if( ! (flags & CI_DAEMON_LOG_TO_KERN) ) {
+    ci_set_log_prefix("");
+    ci_log_fn = ci_log_syslog;
+    openlog(NULL, LOG_PID, LOG_DAEMON);
+  }
+  else {
+    /* Use the new PID when logging. */
+    ci_server_set_log_prefix(log_prefix, srv_bin);
+  }
+
+  rc = dup2(devnull, STDOUT_FILENO);
+  if( rc == -1 )
+    ci_server_init_failed(srv_name, "Failed to dup /dev/null onto stdout: %s",
+                          strerror(errno));
+  rc = dup2(devnull, STDERR_FILENO);
+  if( rc == -1 )
+    ci_server_init_failed(srv_name, "Failed to dup /dev/null onto stderr: %s",
+                          strerror(errno));
+  close(devnull);
+}

@@ -1,0 +1,172 @@
+Onload-9.2.1
+============
+
+ This is an update release of Onload including bug fixes and a new version
+ of the sfc net driver.
+
+ Please see the ChangeLog for a full list of changes.
+
+
+X4 datapath configuration
+-------------------------
+
+The EF_RX_DATAPATH and EF_TX_DATAPATH environment variables are now
+enforced, such that if a requested datapath is not available on all
+interfaces stack creation will fail. For NICs with mixed port
+capabilities the new "auto" mode can be used which will select the best
+available datapath combination for each interface. This is the default.
+
+
+Onload-9.2.0.43
+===============
+
+ This is a feature release of Onload including a new version of the
+ sfc net driver and various features and fixes.
+
+ Please see the ChangeLog for a full list of changes.
+
+
+Linux distribution support
+--------------------------
+
+ This package can be installed on:
+ - Red Hat Enterprise Linux 8.10
+ - Red Hat Enterprise Linux 9.4 - 9.8
+ - Red Hat Enterprise Linux 10.0 - 10.2
+ - Canonical Ubuntu Server LTS 24.04 and 26.04
+ - Debian 12 "Bookworm"
+ - Debian 13 "Trixie"
+ - kernel.org Linux kernels 5.11 - 7.0
+
+
+X4 Express datapath sharing support restored for recent kernels
+---------------------------------------------------------------
+
+This release adds support for kernel.org Linux kernels between version
+6.16 and 7.0. Previously, support for Linux kernel version 6.15 required
+the support for sharing X4 Express datapath queues ("SHRUB support")
+to be disabled at build time for Onload. The SHRUB implementation has
+been reworked so that this constraint no longer applies for any kernel
+version. The 'no-shrub' build profile has been removed.
+
+
+X4 Shared buffer resource management
+------------------------------------
+
+Applications sharing access to X4 Express datapath queues are now protected
+from being starved of buffers by other slow or stalled applications. This
+feature may be controlled by the new EF_SHRUB_MAX_CLIENT_BUFFERS
+configuration option in Onload or by ef_vi_set_shrub_client_buffer_count()
+with ef_vi.
+
+
+Configurable transmit descriptor ring size for X4 Express datapath
+------------------------------------------------------------------
+
+The size of the descriptor ring for transmissions on the X4 Express
+datapath ('CTPIO') is now configurable. The EF_TXQ_SIZE and EF_RXQ_SIZE
+per-interface configuration options have been updated to accept -1
+to indicate that an architecture-appropriate default should be used.
+As a result, up to 256 VIs with TXQs on the X4 Express datapath can
+now be allocated instead of the previous maximum of 128.
+
+
+X4 ef_vi applications can obtain filter ID for received packet
+--------------------------------------------------------------
+
+Applications can now read the ID of the filter used to receive
+a packet on the X4 Enterprise path in ef_vi. A new function call,
+ef_vi_receive_get_filter_id(), provides access to this data including
+with the X4 Express path and X3.
+
+
+X4 SHRUB Controller now interrupt-driven
+----------------------------------------
+
+The SHRUB Controller for managing shared access to X4 Express datapath queues
+no longer spins when interrupts are enabled, instead waiting for interesting
+events to occur before doing any work. This enables multiple shrub controllers
+to run on the same core. Users should be aware that clients freeing buffers
+do not generate interrupts.
+
+As before, enabling interrupts can be done by providing the -i flag at shrub
+controller creation time. For Onload, the EF_SHRUB_USE_INTERRUPTS environment
+variable configures this if a shrub controller is not manually created. An
+additional -p option has been added to the shrub controller, which allows the
+specification of a time after which a poll must occur even if no interrupts
+have been seen. No corresponding option exists yet in Onload to configure this.
+
+
+X4 XDP not yet supported
+------------------------
+
+Onload does not yet support XDP with X4 NICs.
+
+
+X4 firmware versions
+--------------------
+
+X4 firmware version 1.3.2.105 introduced a change to the host interface. This
+version of Onload is updated to reflect that but will also operate safely
+with earlier firmware. However, Onload versions older than 9.2.0 are at risk
+for event queue overflow if used with the newer firmware. Users should upgrade
+to this Onload version when updating their X4 firmware.
+
+
+X4 Express path MTU
+-------------------
+
+The X4 Express path only supports an MTU up to 1500. If the link MTU is
+configured to a larger value via the net driver, this can result in UDP TX
+traffic beyond the max supported size being fragmented or sent via the kernel.
+Incoming RX traffic directed to an express path RXQ that exceeds the supported
+limit will be dropped. To avoid this, the stack should be configured to use the
+X4 Enterprise path or the link MTU should be configured to a value supported by
+both paths.
+
+
+Controlling IRQ affinity for Onload interrupts
+----------------------------------------------
+
+The new configuration option EF_ONLOAD_IRQ_CORES allows a CPU mask to be
+specified as an IRQ affinity hint on interfaces where interrupts are
+managed by Onload.
+
+
+solar_clusterd script moved to SolarCapture
+-------------------------------------------
+
+The solar_clusterd script has moved to the SolarCapture repository:
+https://github.com/Xilinx-CNS/solarcapture/tree/main/src/solar_clusterd
+
+
+Installation from tar.gz release packages
+-----------------------------------------
+
+Installing Onload from 'tarball' release packages is deprecated in general
+in favour of OS-specific release mechanisms, source RPMs and Debian source
+packages.
+
+Support for Onload on new major versions of Operating Systems, which in this
+case means Ubuntu 26.04, will not include installation from tar.gz packages.
+
+
+Notice for future releases
+==========================
+
+Programmatic interface planned to configure SHRUB
+-------------------------------------------------
+
+A programmatic interface is planned for ef_vi applications to configure
+SHRUB without using Onload-style EF_* environment variables for this purpose.
+When this programmatic interface is available it should be used by all
+ef_vi and TCPDirect applications instead of present arrangements.
+
+
+Last OpenOnload release supporting Red Hat Enterprise Linux 8
+-------------------------------------------------------------
+
+Future OpenOnload releases will not support RHEL 8.
+
+
+(c) Copyright 2026 Advanced Micro Devices, Inc.

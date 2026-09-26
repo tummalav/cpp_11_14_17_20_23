@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0
+# SPDX-FileCopyrightText: (c) Copyright 2026 Advanced Micro Devices, Inc.
+
+[project]
+name = "OpenOnload_utilities"
+version = "1.0"
+license = { text = "GPL-2.0" }
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["scripts"]
+exclude = ["onload_misc"]
+
+[tool.setuptools]
+py-modules = ["sfcmask", "sfcaffinity"]
