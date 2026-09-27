@@ -1,100 +1,71 @@
-# C++ Modern Features & High-Frequency Trading Systems
-> Reorganized: April 2026
-Practicing and understanding in-depth about C++11, 14, 17, 20, 23 standard
-features, and designing ultra-low latency, high-throughput systems for capital
-markets trading: execution systems, order management, exchange/client
-connectivity, risk, compliance, and the full end-to-end trading pipeline.
----
-## Directory Structure
+# Modern C++ and Low-Latency Trading Systems
+
+Examples and reference implementations covering C++11 through C++23, ultra-low-latency engineering, and electronic trading systems. The repository combines standalone language-feature demonstrations with connected market-data, order-book, execution, and exchange-connectivity components.
+
+## Repository Contents
+
+| Directory | Description |
+|---|---|
+| `01_cpp_features/` | Standalone examples organized by C++ standard, plus templates, constexpr, concurrency, and design patterns |
+| `02_ultra_low_latency/` | Latency measurement, CPU and NUMA techniques, lock-free data structures, IPC, networking, and cache-aware containers |
+| `03_trading_apps/` | Exchange handlers, market-data feed handlers, order books, execution algorithms, smart order routing, market making, risk, and position management |
+| `build_scripts/` | Build and benchmark scripts for selected components |
+| `config/` | Configuration templates used by the exchange-handler examples |
+
+The examples are intended as learning and engineering references. Build requirements and operational suitability vary by component; consult its local README or build instructions before use.
+
+## Getting Started
+
+### Build a C++ feature example
+
+The helper script selects the best supported standard available on the system:
+
+```bash
+./compile_cpp20.sh 01_cpp_features/cpp20/cpp20_concepts_use_cases_examples.cpp
 ```
-cpp_11_14_17_20_23/
-│
-├── 01_cpp_features/              C++ language features by standard
-│   ├── cpp11/                    auto, lambda, smart ptrs, rvalue refs, threads
-│   ├── cpp17/                    parallel algorithms, string_view, init features
-│   ├── cpp20/                    concepts, coroutines, ranges, modules, consteval
-│   └── general/                  templates, SFINAE, constexpr, design patterns
-│
-├── 02_ultra_low_latency/         ULL systems & techniques
-│# C++ Modern Features & High-Frequency Trading Systems
-> Reorganized: April 2026
-Prang> Reorganized: April 2026
-Practicing and understandinquPracticing and understanprfeatures, and designing ultra-low latency, high-throughput systems for cactmarkets trading: execution systems, order management, exchange/client
-connectL connectivity, risk, compliance, and the full end-to-end trading pipe  ---
-## Directory Structure
+
+### Build the ASX OUCH example
+
+The root CMake project builds the ASX OUCH plugin and related example programs:
+
+```bash
+./build.sh release
 ```
-cpp_11_14_17_20_23/
-│
-├── 01_cpp_  ## s```
-cpp_11_14_17_20_2cicp, │
-├── 01_c????│   ├── cpp11/                    auto, lambda, smart ptrs, rval f│   ├── cpp17/                    parallel algorithms, string_view, init featur  │   ├── cpp20/                    concepts, coroutines, ranges, modules, consteven│   └── general/                  templates, SFINAE, constexpr, design patterns
-? │
-├── 02_ultra_low_latency/         ULL systems & techniques
-│# C++ Modern F/ ? │# C++ Modern Features & High-Frequency Trading Systems
-> Reo  > Reorganized: April 2026
-Prang> Reorganized: April 2026eLPrang> Reorganized: ApriRoPracticing and understandinqu bconnectL connectivity, risk, compliance, and the full end-to-end trading pipe  ---
-## Directory Structure
+
+Other supported modes are `./build.sh debug`, `./build.sh performance`, and `./build.sh clean`. See `03_trading_apps/exchange_handlers/asx_ouch/README.md` for component-specific details.
+
+### Build selected benchmarks
+
+Benchmark scripts are available in `build_scripts/`, including:
+
+```bash
+build_scripts/build_lockfree_benchmark.sh
+build_scripts/build_containers_benchmark.sh
+build_scripts/build_shm_ipc_benchmark.sh
 ```
-cpp_11_14_17_20_23/
-│
-├── 01_cpp_  ## s```
-cpp_11_14_17_20_2cicp, │
-├── --## Directory Structure
+
+Follow each script's instructions for its working directory and optional dependencies.
+
+## Trading-System Overview
+
+The trading components illustrate a typical event path:
+
+```text
+Exchange market data
+    -> feed handler and order book
+    -> strategy and execution algorithm
+    -> pre-trade risk checks
+    -> smart order router and exchange gateway
+    -> acknowledgments, fills, and position updates
 ```
-cpp_11_14_17_20_23/
-│
-├── 01_cpp_  ## s```
-cpp/u```
-cpp_11_14_17_20_2e-cpr,│
-├── 01_cre?/cpp_11_14_17_20_2cicp, ?|├── 01_c????│   a? │
-├── 02_ultra_low_latency/         ULL systems & techniques
-│# C++ Modern F/ ? │# C++ Modern Features & High-Frequency Trading Systems
-> Reo  > Reorganized: April 2026
-Prang> Reorganized: April 2026eLPrang> Reorganized: ApriRoPracticing and understandinqu bconnectL connectivity, risk, compliance, and the full end-to-end trading pipe  ---
-#  ├?|│# C++ Modern F/ ? │# C++ Modern Features & High-Frequenc| > Reo  > Reorganized: April 2026
-Prang> Reorganized: April 2026eLPrang> ReorgansyPrang> Reorganized: April 2026ecy## Directory Structure
-```
-cpp_11_14_17_20_23/
-│
-├── 01_cpp_  ## s```
-cpp_11_14_17_20_2cicp, │
-├── --## Directory Structure
-```
-cpp_11_14_17_20_23/
-│
-?i```
-cpp_11_14_17_20_2Cacpur│
-├── 01_c v?ocpp_11_14_17_20_2cicp, ? ├── --## Directory `,```
-cpp_11_14_17_20_23/
-│
-├? cpnc│
-├── 01_cs:?-cpp/u```
-cpp_11_14_17_20_recpp_11_LO├── 01_cre?/cpp_1`0├── 02_ultra_low_latency/         ULL systems & techniques
-│# C++ Mlatenc│# C++ Modern F/ ? │# C++ Modern Features & High-Frequencdi> Reo  > Reorganized: April 2026
-Prang> Reorganized: April 2026eLPrang> Reorgan--Prang> Reorganized: April 2026e--#  ├?|│# C++ Modern F/ ? │# C++ Modern Features & High-Frequenc| > Reo  > Reorganized: April 2026
-Prang> Reorganized: April 2026eLPrang> ReorgansyPrang> Reorgan  Prang> Reorganized: April 2026eLPrang> ReorgansyPrang> Reorganized: April 2026ecy## Directory Structure
-``ha```
-cpp_11_14_17_20_23/
-│
-├── 01_cpp_  ## s```
-cpp_11_14_17_20_2cicp, │
-├── --## Direclucpn │
-├── 01_c0K?dcpp_11_14_17_20_2cicp, ?d├── --## Directory MD```
-cpp_11_14_17_20_23/
-│
-?i`chcpge│
-?i```
-cpp_11/`? cpp_11CH├── 01_c v?ocpp_1dlcpp_11_14_17_20_23/
-│
-├? cpnc│
-├── 01_cs:?-cpp/u```
-cpp_11_1nd│
-├? cpnc│**? `├── 01_pscpp_11_14_17_20_recpp_11_LOe_│# C++ Mlatenc│# C++ Modern F/ ? │# C++ Modern Features & High-Frequencdi> Reo  > Reorganized: April 2026
-PrangPrang> Reorganized: April 2026eLPrang> Reorgan--Prang> Reorganized: April 2026e--#  ├?|│# C++ Modern F/ ?hPrang> Reorganized: April 2026eLPrang> ReorgansyPrang> Reorgan  Prang> Reorganized: April 2026eLPrang> ReorgansyPrang> Reorganized: April 2026ecy## Directory Structure
-``ha```
-cpp_11_14_1il``ha```
-cpp_11_14_17_20_23/
-│
-├── 01_cpp_  ## s```
-cpp_11_14_17_20_2cicp, │
-├── --## Direclucpn │wc -l /Users/tummalavenkatasateesh/github_repos/cpp_11_14_17_20_23/README.md && head -5 /Users/tummalavenkatasateesh/github_repos/cpp_11_14_17_20_23/README.md
+
+Protocol-specific handlers, local build instructions, and design notes live beside their implementations under `03_trading_apps/`.
+
+## Further Reading
+
+- `02_ultra_low_latency/core/ULTRA_LOW_LATENCY_ANALYSIS.md` — low-latency design considerations
+- `02_ultra_low_latency/core/LATENCY_BENCHMARKING_README.md` — latency measurement and benchmark guidance
+- `02_ultra_low_latency/core/TRADING_PIPELINE_ARCHITECTURE.md` — end-to-end trading pipeline
+- `02_ultra_low_latency/lockfree/LOCKFREE_SHM_IPC_GUIDE.md` — shared-memory ring-buffer IPC
+- `03_trading_apps/exchange_handlers/EXCHANGE_PROTOCOLS_CONNECTIVITY.md` — exchange protocol overview
+- `03_trading_apps/orderbook/JAVA_VS_CPP_ORDERBOOK.md` — order-book implementation trade-offs
